@@ -79,6 +79,7 @@ def original_date(lines, published):
 
 class PolicyCollector(NoticeCollector):
     cap_option = "max_policies"
+    record_kinds = ("policies",)
 
     def matches(self, title, listing):
         if listing["type"] == "guidance":

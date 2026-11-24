@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
@@ -6,7 +7,8 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import String, cast, delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
-from .db import attachments, digest, now, org, paper_keys, paper_org, records, sequences, tombstones
+from .db import attachments, digest, now, org, paper_keys, paper_org, patent_keys, records, sequences, tombstones
+from .patent_identity import patent_key, patent_lookup_keys
 from .schema import REVIEW, SPECS, clean_values
 
 
@@ -55,6 +57,31 @@ def next_code(conn, kind):
         number = conn.execute(stmt.returning(table.c.value)).scalar_one()
 
 
+def re_cn_application(key):
+    return re.fullmatch(r"patent:20\d{2}[12389]\d{7}", key)
+
+
+def find_patent(conn, keys, title, found=None):
+    table = records["patents"]
+    filters = [table.c.unique_key.in_(keys)]
+    filters.extend(table.c.unique_key.like(key + "._") for key in keys if re_cn_application(key))
+    filters.append(table.c.id.in_(select(patent_keys.c.record_id).where(patent_keys.c.key.in_(keys))))
+    hits = conn.execute(select(table).where(or_(*filters)).limit(2)).mappings().all()
+    if len(hits) > 1:
+        raise Conflict("专利编号分别命中不同记录，请人工核对")
+    if hits:
+        return hits[0]
+    title_key = patent_key(title, "")
+    number = table.c["values"]["专利号"].as_string()
+    candidates = select(table).where(table.c.unique_key == title_key, or_(number.is_(None), number == ""))
+    if not any(key.startswith("patent:") for key in keys):
+        candidates = select(table).where(table.c["values"]["专利名称"].as_string() == title)
+    hits = conn.execute(candidates.limit(2)).mappings().all()
+    if len(hits) > 1:
+        raise Conflict("专利名称匹配多条记录，请提供专利号码")
+    return hits[0] if hits else found
+
+
 def upsert_entry(conn, source_id, entry, *, return_id=False):
     spec, table = SPECS[entry.kind], records[entry.kind]
     values = clean_values(entry.kind, entry.values)
@@ -62,13 +89,21 @@ def upsert_entry(conn, source_id, entry, *, return_id=False):
         raise ValueError(f"缺少{spec.title}")
     if spec.code:
         values.pop(spec.code, None)
-    if conn.scalar(select(tombstones.c.key).where(
-        tombstones.c.kind == entry.kind, tombstones.c.key.in_((entry.key, *entry.aliases))).limit(1)):
+    lookup = (entry.key, *entry.aliases)
+    aliases_table = paper_keys if entry.kind == "papers" else patent_keys if entry.kind == "patents" else None
+    if entry.kind == "patents":
+        lookup = patent_lookup_keys(lookup)
+    blocked = [tombstones.c.key.in_(lookup)]
+    if entry.kind == "patents":
+        blocked.extend(tombstones.c.key.like(key + "._") for key in lookup if re_cn_application(key))
+    if conn.scalar(select(tombstones.c.key).where(tombstones.c.kind == entry.kind, or_(*blocked)).limit(1)):
         return ("skipped", None) if return_id else "skipped"
     fingerprint = digest([values, entry.url, entry.org_id, sorted(entry.org_ids), entry.evidence_date])
     found = conn.execute(select(table).where(table.c.unique_key == entry.key)).mappings().one_or_none()
-    if entry.aliases:
-        ids = set(conn.scalars(select(paper_keys.c.record_id).where(paper_keys.c.key.in_(entry.aliases))))
+    if entry.kind == "patents":
+        found = find_patent(conn, lookup, values[spec.title], found)
+    elif entry.aliases and aliases_table is not None:
+        ids = set(conn.scalars(select(aliases_table.c.record_id).where(aliases_table.c.key.in_(entry.aliases))))
         if found:
             ids.add(found["id"])
         if len(ids) > 1:
@@ -89,21 +124,53 @@ def upsert_entry(conn, source_id, entry, *, return_id=False):
     if entry.kind == "policies":
         previous = found["values"] if found else {}
         values["上传时间"] = previous.get("上传时间") or (found["created_at"][:10] if found else local_date())
+    source_url, org_id, evidence_date = entry.url, entry.org_id, entry.evidence_date
     if entry.kind == "patents" and found:
-        if found["evidence_date"] > entry.evidence_date:
+        previous = found["values"]
+        same_source = source_id == found["source_id"]
+        if same_source and found["evidence_date"] > entry.evidence_date:
             return ("skipped", found["id"]) if return_id else "skipped"
-        values = {key: value for key, value in values.items() if value is not None or not found["values"].get(key)}
-    if found and found["content_hash"] == fingerprint:
+        values = {key: value for key, value in values.items() if value is not None or not previous.get(key)}
+        if source_id == "ecnu_lens_patents" and not same_source:
+            # Keep the school notice as primary evidence while allowing Lens to fill gaps.
+            values = {key: value for key, value in values.items()
+                      if not previous.get(key) or key in {"授权年份", "法律状态", "技术领域关键词"}}
+            for key in ("授权年份", "法律状态", "技术领域关键词"):
+                if values.get(key) is None:
+                    values.pop(key, None)
+            source_url, source_id, evidence_date = found["source_url"] or source_url, found["source_id"] or source_id, found["evidence_date"]
+            org_id = found["org_unit_id"] or org_id
+        elif not same_source:
+            org_id = org_id or found["org_unit_id"]
+        if source_id == "ecnu_kjc_transfer" and previous.get("法律状态") == "无效" and values.get("法律状态") == "授权":
+            if conn.scalar(select(patent_keys.c.key).where(patent_keys.c.record_id == found["id"],
+                                                          patent_keys.c.key.like("lens:%")).limit(1)):
+                values.pop("法律状态")
+        if previous.get("专利号") and values.get("专利号"):
+            old_key = patent_key("", previous["专利号"])
+            new_key = patent_key("", values["专利号"])
+            if old_key != new_key and ("." in old_key or "." not in new_key):
+                values.pop("专利号")
+    if entry.kind == "patents" and found:
+        locked = set(found["locked_fields"])
+        merged = found["values"] | {key: value for key, value in values.items() if key not in locked}
+        patent_unchanged = (merged == found["values"] and
+                            (source_url == found["source_url"] or "@source_url" in locked) and
+                            (org_id == found["org_unit_id"] or "@org_unit_id" in locked) and
+                            evidence_date == found["evidence_date"] and source_id == found["source_id"])
+    else:
+        patent_unchanged = False
+    if found and ((entry.kind != "patents" and found["content_hash"] == fingerprint) or patent_unchanged):
         result, record_id = "skipped", found["id"]
     elif found:
         locked = set(found["locked_fields"])
         revisions = {key: value for key, value in values.items() if key not in locked}
         conn.execute(update(table).where(table.c.id == found["id"]).values(
             values=found["values"] | revisions, content_hash=fingerprint,
-            source_url=found["source_url"] if "@source_url" in locked else entry.url,
+            source_url=found["source_url"] if "@source_url" in locked else source_url,
             source_id=source_id or found["source_id"],
-            org_unit_id=found["org_unit_id"] if "@org_unit_id" in locked else entry.org_id,
-            evidence_date=entry.evidence_date, updated_at=now()))
+            org_unit_id=found["org_unit_id"] if "@org_unit_id" in locked else org_id,
+            evidence_date=evidence_date, updated_at=now()))
         result, record_id = "updated", found["id"]
     else:
         code = next_code(conn, entry.kind) if spec.code else None
@@ -114,8 +181,11 @@ def upsert_entry(conn, source_id, entry, *, return_id=False):
             org_unit_id=entry.org_id, evidence_date=entry.evidence_date, content_hash=fingerprint,
             source_id=source_id, source_url=entry.url, created_at=stamp, updated_at=stamp)).inserted_primary_key[0]
         result = "inserted"
-    for alias in entry.aliases:
-        conn.execute(insert(paper_keys).values(key=alias, record_id=record_id).on_conflict_do_nothing())
+    if aliases_table is not None:
+        aliases = lookup if entry.kind == "patents" else entry.aliases
+        for alias in aliases:
+            if not alias.startswith("title:"):
+                conn.execute(insert(aliases_table).values(key=alias, record_id=record_id).on_conflict_do_nothing())
     if entry.kind == "papers" and result != "skipped" and not (found and "@org_unit_id" in found["locked_fields"]):
         conn.execute(delete(paper_org).where(paper_org.c.paper_id == record_id))
         for unit_id in set(entry.org_ids):
@@ -133,77 +203,81 @@ def unit_links(conn, rows):
 
 
 def save_record(db, kind, record_id, body):
+    with db.write() as conn:
+        return write_record(conn, kind, record_id, body)
+
+
+def write_record(conn, kind, record_id, body, *, import_key=None):
     spec, table = SPECS[kind], records[kind]
     values = clean_values(kind, body.values, validate=True)
-    with db.write() as conn:
-        found = (conn.execute(select(table).where(table.c.id == record_id)).mappings().one_or_none()
-                 if record_id else None)
-        if record_id and not found:
-            raise LookupError("记录不存在")
-        if found and body.expected_updated_at and body.expected_updated_at != found["updated_at"]:
-            raise Conflict("记录已有更新，请重新打开后编辑")
-        old = found["values"] if found else {}
-        merged = old | values
-        if not merged.get(spec.title):
-            raise ValueError(f"请填写{spec.title}")
-        if kind == "services" and "章节" in values:
-            merged["章节数"] = len(merged["章节"])
-            values["章节数"] = merged["章节数"]
-        supplied = body.model_fields_set
-        source_url = body.source_url or "" if "source_url" in supplied else found["source_url"] if found else ""
-        unit_id = body.org_unit_id if "org_unit_id" in supplied else found["org_unit_id"] if found else None
-        edit_paper_units = kind == "papers" and bool({"org_unit_id", "org_unit_ids"} & supplied)
-        paper_units = list(dict.fromkeys(body.org_unit_ids or [])) if "org_unit_ids" in supplied else ([unit_id] if unit_id else [])
-        requested_units = paper_units if edit_paper_units else ([unit_id] if unit_id else [])
-        if requested_units and set(requested_units) != set(conn.scalars(select(org.c.id).where(
-                org.c.id.in_(requested_units), org.c.archived.is_(False)))):
-            raise ValueError("院系不存在")
-        if edit_paper_units:
-            unit_id = None
-        review = body.review_status or (found["review_status"] if found else "pending")
-        if review not in REVIEW:
-            raise ValueError("审核状态无效")
-        if kind == "papers" and "DOI/链接" in values:
-            doi = doi_key(merged.get("DOI/链接"))
-            owner = conn.scalar(select(paper_keys.c.record_id).where(paper_keys.c.key == doi)) if doi else None
-            if owner is not None and owner != record_id:
-                raise Conflict("该 DOI 已关联另一条论文")
-        else:
-            doi = None
-        code = merged.get(spec.code) if spec.code else None
-        if spec.code:
-            if not code:
-                code = found["record_code"] if found else next_code(conn, kind)
-            code = str(code)
-            existing = conn.scalar(select(table.c.id).where(table.c.record_code == code))
-            if existing and existing != record_id:
-                raise Conflict(f"{spec.code}已存在")
-            merged[spec.code] = code
-        locked = set(found["locked_fields"] if found else ())
-        locked.update(key for key in values if merged.get(key) != old.get(key))
-        if found:
-            if found["source_url"] != source_url:
-                locked.add("@source_url")
-            if found["org_unit_id"] != unit_id:
-                locked.add("@org_unit_id")
-        if edit_paper_units:
+    found = (conn.execute(select(table).where(table.c.id == record_id)).mappings().one_or_none()
+             if record_id else None)
+    if record_id and not found:
+        raise LookupError("记录不存在")
+    if found and body.expected_updated_at and body.expected_updated_at != found["updated_at"]:
+        raise Conflict("记录已有更新，请重新打开后编辑")
+    old = found["values"] if found else {}
+    merged = old | values
+    if not merged.get(spec.title):
+        raise ValueError(f"请填写{spec.title}")
+    if kind == "services" and "章节" in values:
+        merged["章节数"] = len(merged["章节"])
+        values["章节数"] = merged["章节数"]
+    supplied = body.model_fields_set
+    source_url = body.source_url or "" if "source_url" in supplied else found["source_url"] if found else ""
+    unit_id = body.org_unit_id if "org_unit_id" in supplied else found["org_unit_id"] if found else None
+    edit_paper_units = kind == "papers" and bool({"org_unit_id", "org_unit_ids"} & supplied)
+    paper_units = list(dict.fromkeys(body.org_unit_ids or [])) if "org_unit_ids" in supplied else ([unit_id] if unit_id else [])
+    requested_units = paper_units if edit_paper_units else ([unit_id] if unit_id else [])
+    if requested_units and set(requested_units) != set(conn.scalars(select(org.c.id).where(
+            org.c.id.in_(requested_units), org.c.archived.is_(False)))):
+        raise ValueError("院系不存在")
+    if edit_paper_units:
+        unit_id = None
+    review = body.review_status or (found["review_status"] if found else "pending")
+    if review not in REVIEW:
+        raise ValueError("审核状态无效")
+    if kind == "papers" and "DOI/链接" in values:
+        doi = doi_key(merged.get("DOI/链接"))
+        owner = conn.scalar(select(paper_keys.c.record_id).where(paper_keys.c.key == doi)) if doi else None
+        if owner is not None and owner != record_id:
+            raise Conflict("该 DOI 已关联另一条论文")
+    else:
+        doi = None
+    code = merged.get(spec.code) if spec.code else None
+    if spec.code:
+        if not code:
+            code = found["record_code"] if found else next_code(conn, kind)
+        code = str(code)
+        existing = conn.scalar(select(table.c.id).where(table.c.record_code == code))
+        if existing and existing != record_id:
+            raise Conflict(f"{spec.code}已存在")
+        merged[spec.code] = code
+    locked = set(found["locked_fields"] if found else ())
+    locked.update(key for key in values if import_key or merged.get(key) != old.get(key))
+    if found:
+        if found["source_url"] != source_url:
+            locked.add("@source_url")
+        if found["org_unit_id"] != unit_id:
             locked.add("@org_unit_id")
-        stamp = now()
-        row = dict(values=merged, review_status=review, source_url=source_url, org_unit_id=unit_id,
-                   record_code=code, is_manual_locked=bool(locked), locked_fields=sorted(locked), updated_at=stamp)
-        if found:
-            conn.execute(update(table).where(table.c.id == record_id).values(**row))
-        else:
-            record_id = conn.execute(insert(table).values(**row, unique_key=f"manual:{uuid4().hex}",
-                         content_hash=digest(merged), created_at=stamp)).inserted_primary_key[0]
-        if doi:
-            conn.execute(insert(paper_keys).values(key=doi, record_id=record_id).on_conflict_do_nothing())
-        if edit_paper_units:
-            conn.execute(delete(paper_org).where(paper_org.c.paper_id == record_id))
-            if paper_units:
-                conn.execute(insert(paper_org), [{"paper_id": record_id, "unit_id": unit} for unit in paper_units])
-        result = dict(conn.execute(select(table).where(table.c.id == record_id)).mappings().one())
-        return unit_links(conn, [result])[0] if kind == "papers" else result
+    if edit_paper_units or import_key and "org_unit_id" in supplied:
+        locked.add("@org_unit_id")
+    stamp = now()
+    row = dict(values=merged, review_status=review, source_url=source_url, org_unit_id=unit_id,
+               record_code=code, is_manual_locked=bool(locked), locked_fields=sorted(locked), updated_at=stamp)
+    if found:
+        conn.execute(update(table).where(table.c.id == record_id).values(**row))
+    else:
+        record_id = conn.execute(insert(table).values(**row, unique_key=import_key or f"manual:{uuid4().hex}",
+                     content_hash=digest(merged), created_at=stamp)).inserted_primary_key[0]
+    if doi:
+        conn.execute(insert(paper_keys).values(key=doi, record_id=record_id).on_conflict_do_nothing())
+    if edit_paper_units:
+        conn.execute(delete(paper_org).where(paper_org.c.paper_id == record_id))
+        if paper_units:
+            conn.execute(insert(paper_org), [{"paper_id": record_id, "unit_id": unit} for unit in paper_units])
+    result = dict(conn.execute(select(table).where(table.c.id == record_id)).mappings().one())
+    return unit_links(conn, [result])[0] if kind == "papers" else result
 
 
 def doi_key(value):
@@ -257,6 +331,8 @@ def delete_record(db, kind, record_id, expected):
         if expected and expected != row.updated_at:
             raise Conflict("记录已有更新，请重新打开后删除")
         keys = [row.unique_key]
+        if kind == "patents":
+            keys.extend(conn.scalars(select(patent_keys.c.key).where(patent_keys.c.record_id == record_id)))
         if kind == "papers":
             keys.extend(conn.scalars(select(paper_keys.c.key).where(paper_keys.c.record_id == record_id)))
             conn.execute(delete(paper_keys).where(paper_keys.c.record_id == record_id))

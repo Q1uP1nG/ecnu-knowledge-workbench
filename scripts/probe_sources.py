@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.collectors import COLLECTORS
+from app.collectors.lens_patents import token as lens_token
 from app.collectors.base import link, text_of
 from app.db import Database, now
 from app.runner import RunContext, RunManager
@@ -92,19 +93,28 @@ def probe_notices(collector):
             print("    ", entry.kind, entry.key, "原件", [original.filename for original in entry.attachments])
 
 
+def probe_lens(collector):
+    today = now()[:10]
+    page = collector.request(collector.query("1900-01-01", today, "desc", 0, 1), lens_token())
+    print("  Lens 命中专利", page["total"])
+    for patent in page["data"]:
+        collector.emit_patent(patent)
+
+
 PROBES = {
     "ecnu_faculty": probe_faculty,
     "ecnu_openalex_papers": probe_papers,
     "ecnu_science_park": probe_park,
     "ecnu_kjc_transfer": probe_notices,
     "shanghai_policies": probe_notices,
+    "ecnu_lens_patents": probe_lens,
 }
 
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="探测五个公开来源的页面结构与接口")
+    parser = argparse.ArgumentParser(description="探测配置中的采集来源")
     parser.add_argument("--source", choices=("all", *COLLECTORS), default="all")
     args = parser.parse_args()
     failed = False

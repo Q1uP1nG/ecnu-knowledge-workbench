@@ -14,6 +14,7 @@ from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.engine import URL
 
 from .schema import SPECS
+from .patent_identity import patent_key, patent_lookup_keys
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "config" / "sources.yaml"
@@ -144,6 +145,10 @@ paper_org = Table("paper_org_units", metadata,
     Column("paper_id", ForeignKey("kb_papers.id", ondelete="CASCADE"), primary_key=True),
     Column("unit_id", ForeignKey("org_units.id", ondelete="CASCADE"), primary_key=True, index=True),
 )
+patent_keys = Table("patent_keys", metadata,
+    Column("key", String, primary_key=True),
+    Column("record_id", ForeignKey("kb_patents.id", ondelete="CASCADE"), nullable=False, index=True),
+)
 
 
 class Database:
@@ -163,7 +168,22 @@ class Database:
 
     def initialize(self):
         with self.write() as conn:
+            new_patent_index = conn.exec_driver_sql(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='patent_keys'"
+            ).scalar_one_or_none() is None
             metadata.create_all(conn)
+            if new_patent_index:
+                by_number = {}
+                duplicates = set()
+                for record_id, values in conn.execute(select(records["patents"].c.id, records["patents"].c["values"])):
+                    if number := values.get("专利号"):
+                        for key in patent_lookup_keys((patent_key("", number),)):
+                            if key in by_number:
+                                duplicates.add(key)
+                            by_number[key] = record_id
+                aliases = [{"key": key, "record_id": by_number[key]} for key in by_number.keys() - duplicates]
+                if aliases:
+                    conn.execute(insert(patent_keys), aliases)
             legacy_paper_links = False
             for table_name, new_column in (("crawl_runs", "cancel_requested_at"), ("crawl_sources", "last_batch_at"),
                                            ("record_tombstones", "record_key")):

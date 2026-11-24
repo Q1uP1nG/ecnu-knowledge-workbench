@@ -1,11 +1,14 @@
 import re
+from dataclasses import replace
 from datetime import date
 from pathlib import PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup
+from sqlalchemy import select
 
 from ..attachments import Original, clean_filename
+from ..db import records
 from .base import BaseCollector, FetchError, clean, link, preferred, text_of
 
 
@@ -44,12 +47,21 @@ def archived_originals(url, title, article, raw, selector):
 
 class NoticeCollector(BaseCollector):
     cap_option = ""
+    record_kinds = ()
 
     def matches(self, title, listing):
         raise NotImplementedError
 
     def entries(self, url, raw, listing_date):
         raise NotImplementedError
+
+    def listing_links(self, url, page, listing):
+        host = urlsplit(url).hostname
+        for anchor in page.select(self.config["selectors"]["list_link"]):
+            heading = clean(anchor.get("title")) or text_of(anchor)
+            target = link(url, anchor.get("href"), host)
+            if target and self.matches(heading, listing):
+                yield target, notice_date(text_of(anchor.find_parent("li")))
 
     def articles(self):
         selectors = self.config["selectors"]
@@ -64,12 +76,10 @@ class NoticeCollector(BaseCollector):
                 anchors = page.select(selectors["list_link"])
                 if not anchors:
                     raise ValueError(f"公示列表没有命中配置的链接选择器：{url}")
-                for anchor in anchors:
-                    heading = clean(anchor.get("title")) or text_of(anchor)
-                    target = link(url, anchor.get("href"), host)
-                    if target and target not in seen_articles and self.matches(heading, listing):
+                for target, published in self.listing_links(url, page, listing):
+                    if target not in seen_articles:
                         seen_articles.add(target)
-                        yield target, notice_date(text_of(anchor.find_parent("li")))
+                        yield target, published
                 following = next((a for a in page.select(selectors["next_page"]) if "下一页" in text_of(a)), None)
                 url = link(url, following.get("href"), host) if following else ""
 
@@ -86,6 +96,9 @@ class NoticeCollector(BaseCollector):
         return title, article, published, archived_originals(url, title, article, raw, selectors["attachment"])
 
     def collect(self):
+        if self.options.get("replay_cache"):
+            self.replay()
+            return
         cap = self.options.get(self.cap_option)
         for index, (url, published) in enumerate(self.articles(), 1):
             try:
@@ -101,3 +114,52 @@ class NoticeCollector(BaseCollector):
                 self.ctx.failure(f"公示页采集失败：{exc}", url)
             if cap and index >= cap:
                 break
+
+    def replay(self):
+        listings = {}
+        for listing in self.config["listings"]:
+            root = urlsplit(listing["url"])
+            stem, _, extension = root.path.rpartition(".")
+            pattern = re.compile(re.escape(stem) + r"\d*\." + re.escape(extension))
+            listings.setdefault(root.hostname, []).append((pattern, listing))
+
+        record_dates = {}
+        with self.ctx.db.engine.connect() as conn:
+            for kind in self.record_kinds:
+                table = records[kind]
+                for url, published in conn.execute(select(table.c.source_url, table.c.evidence_date).where(
+                    table.c.source_id == self.ctx.source_id, table.c.evidence_date != ""
+                )):
+                    record_dates[url] = max(published, record_dates.get(url, ""))
+
+        listing_dates, details, seen = {}, {}, set()
+        selectors = self.config["selectors"]
+        for url, raw in self.cached("text/html"):
+            parsed = urlsplit(url)
+            candidates = listings.get(parsed.hostname)
+            if not candidates or url in seen:
+                continue
+            seen.add(url)
+            listing = next((item for pattern, item in candidates if pattern.fullmatch(parsed.path)), None)
+            page = BeautifulSoup(raw, "lxml")
+            if listing is not None:
+                for target, published in self.listing_links(url, page, listing):
+                    if published:
+                        listing_dates.setdefault(target, published)
+            else:
+                title = text_of(preferred(page, selectors["title"]))
+                if preferred(page, selectors["article"]) is not None and (
+                    url in record_dates or any(self.matches(title, item) for _, item in candidates)
+                ):
+                    details[url] = raw
+
+        for url in reversed(details):
+            self.ctx.heartbeat()
+            try:
+                published = listing_dates.get(url) or record_dates.get(url, "")
+                for entry in self.entries(url, details[url], published):
+                    originals = tuple(replace(original, fetchable=False) for original in entry.attachments)
+                    self.ctx.emit(replace(entry, attachments=originals))
+            except (ValueError, RuntimeError) as exc:
+                self.ctx.failure(f"公示快照解析失败：{exc}", url)
+        self.ctx.log("info", f"本地公示快照重解析 · {len(details)} 篇")

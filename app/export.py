@@ -8,13 +8,14 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from sqlalchemy import func, select
 
 from .attachments import clean_filename, original_path
 from .db import attachments, org, paper_org, records, sources
-from .schema import COMPANY, POLICY, RESEARCH, SERVICE, SPECS
+from .schema import AMOUNTS, CHOICES, COMPANY, DATES, HINTS, INTEGERS, POLICY, RESEARCH, SERVICE, SPECS
 
 GROUPS = {SERVICE: ("services",), POLICY: ("policies",), COMPANY: ("companies",),
           RESEARCH: ("faculty", "patents", "papers", "projects")}
@@ -78,7 +79,7 @@ def export_cell(value, strict, affected, key):
     return encoded[:65400].decode("utf-16-le", errors="ignore") + TRUNCATION_NOTE
 
 
-def save_excel(conn, review, target, strict=False, *, kinds_filter=None):
+def save_excel(conn, review, target, strict=False, *, kinds_filter=None, template=False):
     workbook = Workbook()
     affected = set()
     for sheet_name, kinds in GROUPS.items():
@@ -96,8 +97,33 @@ def save_excel(conn, review, target, strict=False, *, kinds_filter=None):
                 write_row(sheet, row_index, [SPECS[kind].label] + [""] * (len(fields) - 1), section=True)
                 row_index += 1
             write_row(sheet, row_index, fields, header=True)
+            if template:
+                spec = SPECS[kind]
+                for index, field in enumerate(fields, 1):
+                    hints = [HINTS.get(field)]
+                    if field == spec.title:
+                        hints.append("每条记录必填。")
+                    if field == spec.code:
+                        hints.append(f"已有记录用编号匹配，新记录可留空自动分配，如 {spec.prefix}001。")
+                    if field in CHOICES:
+                        hints.append("可选值：" + "、".join(CHOICES[field]))
+                    if field in DATES and field not in HINTS:
+                        hints.append("填写日期，格式 YYYY-MM-DD。")
+                    if field in INTEGERS:
+                        hints.append("填写整数。")
+                    if field in AMOUNTS:
+                        hints.append("填写数字。")
+                    if field == spec.title and sheet_name == RESEARCH:
+                        hints.append("可在分区表头右侧增加「院系」辅助列。")
+                    if field == "备注" and kind == "faculty":
+                        hints.append("可记录内部联络手机号。")
+                    if hint := "\n".join(filter(None, hints)):
+                        sheet.cell(row_index, index).comment = Comment(hint, "知识库工作台")
             row_index += 1
-            if kinds_filter is None or kind in kinds_filter:
+            if template:
+                write_row(sheet, row_index, [None] * len(fields))
+                row_index += 1
+            elif kinds_filter is None or kind in kinds_filter:
                 for row in export_records(conn, kind, review):
                     for entry in horizontal_rows(kind, row["values"]):
                         write_row(sheet, row_index, [export_cell(entry.get(field), strict, affected, (kind, row["id"]))
@@ -236,12 +262,15 @@ def school_paper_links(review):
 def school_coverage_csv(conn, review):
     nodes = [dict(row) for row in conn.execute(select(org).where(org.c.archived.is_(False)).order_by(org.c.id)).mappings()]
     by_id = {row["id"]: row for row in nodes}
-    faculty = records["faculty"]
-    counts = select(faculty.c.org_unit_id, func.count()).group_by(faculty.c.org_unit_id)
-    if review:
-        counts = counts.where(faculty.c.review_status == review)
+    direct_counts = {}
+    for kind in ("faculty", "patents", "projects"):
+        table = records[kind]
+        counts = select(table.c.org_unit_id, func.count()).group_by(table.c.org_unit_id)
+        if review:
+            counts = counts.where(table.c.review_status == review)
+        direct_counts[kind] = dict(conn.execute(counts).all())
     all_links = school_paper_links(review)
-    faculty_counts = dict(conn.execute(counts).all())
+    faculty_counts, patent_counts, project_counts = (direct_counts[kind] for kind in ("faculty", "patents", "projects"))
     paper_counts = dict(conn.execute(select(all_links.c.unit_id, func.count()).group_by(all_links.c.unit_id)).all())
     state = conn.scalar(select(sources.c.cursor_json).where(sources.c.id == "ecnu_faculty")) or {}
     last_seen = state.get("faculty_units", {})
@@ -249,7 +278,8 @@ def school_coverage_csv(conn, review):
     with TextIOWrapper(output, encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
         writer.writerow(("院系ID", "上级院系ID", "院系路径", "类型", "官网", "教师目录", "自身启用",
-                         "本节点师资条数", "本节点论文条数", "最近尝试采集时间（UTC）"))
+                         "本节点师资条数", "本节点论文条数", "本节点专利条数", "本节点学院项目条数",
+                         "最近尝试采集时间（UTC）"))
         for node in nodes:
             path, seen = [], set()
             parent = node
@@ -260,7 +290,8 @@ def school_coverage_csv(conn, review):
             uid = node["id"]
             writer.writerow([csv_value(value) for value in (uid, node["parent_id"], " / ".join(reversed(path)), node["type"],
                               node["website_url"], node["faculty_url"], "是" if node["enabled"] else "否",
-                              faculty_counts.get(uid, 0), paper_counts.get(uid, 0), last_seen.get(str(uid), ""))])
+                              faculty_counts.get(uid, 0), paper_counts.get(uid, 0), patent_counts.get(uid, 0),
+                              project_counts.get(uid, 0), last_seen.get(str(uid), ""))])
         stream.flush()
         return output.getvalue()
 

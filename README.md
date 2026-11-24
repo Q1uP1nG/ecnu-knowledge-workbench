@@ -11,9 +11,10 @@ app/
   schema.py              Excel 原始字段、顺序与填写提示
   store.py               业务记录、编号、字段锁和院系关系
   runner.py              采集任务、日志、游标与 APScheduler
-  collectors/            统一 HTTP 入口与五个来源
+  collectors/            统一 HTTP 入口与六个来源
   enrich.py              BaseEnricher 接口及 LLMEnricher 占位
   export.py              Excel、JSONL 与 ZIP 交付包导出
+  importer.py            Excel 模板、预检与原子导入
   attachments.py         原件登记、下载、上传与文件存储
   demo.py                可重复载入的示例
   static/                Vue 3 单页工作台与本地资产
@@ -69,6 +70,7 @@ python -m venv .venv
 
 ```powershell
 .\.venv\Scripts\python.exe cli.py run --source ecnu_faculty --max-units 3 --max-teachers-per-unit 5
+.\.venv\Scripts\python.exe cli.py run-all --scope school --skip-recent-days 7
 .\.venv\Scripts\python.exe cli.py run --source ecnu_openalex_papers --mode incremental --publication-year 2026 --max-papers 30
 .\.venv\Scripts\python.exe cli.py run --source ecnu_science_park --mode incremental
 .\.venv\Scripts\python.exe cli.py run --source ecnu_kjc_transfer --max-notices 20 --download-attachments
@@ -82,7 +84,20 @@ python -m venv .venv
 .\.venv\Scripts\python.exe cli.py tombstones restore --kind papers --key openalex:W123
 ```
 
-Web 定时默认关闭。可在 **采集与调度** 开关定时、编辑五段式 Cron，时区为 Asia/Shanghai。Web 定时需要服务持续运行。用 Windows 任务计划程序时，程序填写虚拟环境的 `python.exe`，参数填写 CLI 命令，起始目录填写项目目录。CLI 也可用于 Linux crontab。两个入口复用同一数据库和来源任务锁。请为长期 Web 定时使用一个 Uvicorn 工作进程。
+Web 定时默认关闭。可在 **采集与调度** 开关定时、编辑五段式 Cron，时区为 Asia/Shanghai。Web 定时需要服务持续运行。CLI 定时可独立运行，并复用同一个数据库和来源任务锁。
+
+`run-all --scope school` 依次增量采集师资、论文和科技处公示。`--scope all` 还执行科技园、扶持政策和 Lens。单个来源失败或被占用时继续其余来源，JSON 汇总会标出对应状态。`--skip-recent-days 7` 跳过最近 7 天内更新过或成功检查过的师资主页，目录仍会读取。默认值 `0` 关闭跳过，全量模式始终读取详情。
+
+### Windows 任务计划
+
+```powershell
+.\scripts\manage_schedule.ps1 -Action Install -DryRun
+.\scripts\manage_schedule.ps1 -Action Install -DailyAt '03:10' -WeeklyDay Sunday -WeeklyAt '04:30'
+.\scripts\manage_schedule.ps1 -Action Status
+.\scripts\manage_schedule.ps1 -Action Uninstall
+```
+
+时间使用 Windows 的本地时区。每日任务采用来源默认批次，周任务遍历全部启用师资目录，每院系默认取 5 人。`-WeeklyTeachersPerUnit 0` 可遍历每个目录的全部条目。默认以当前 Windows 用户登录时运行。需要在注销后运行时，可用 `-Credential (Get-Credential)` 登记任务账户。每轮 JSON 摘要追加到 `data/logs/scheduled-YYYYMM.log`。
 
 师资与 OpenAlex 增量运行会复用来源进度。科技处与政策源每次复查配置范围，按公示 URL 或专利号更新、归档及去重。可勾选本次取消抽样上限，或在配置中把数量设为 `0`，公告页数上限由 YAML 配置维护。OpenAlex 批次达到上限且还有结果时，任务显示“未完全完成”，下一次增量从保存的页进度继续。`--dry-run` 会实际发出公开请求并试解析，业务记录、水位线和原始快照均不落库。可用 `KB_DB_PATH`（Web 与 CLI）或 CLI 全局 `--db` 指向独立数据库。
 
@@ -90,7 +105,19 @@ Web 定时默认关闭。可在 **采集与调度** 开关定时、编辑五段�
 
 按年份采集论文时，每个查询窗口独立保留进度。例如 `cli.py run --source ecnu_openalex_papers --publication-year 2026 --max-papers 60` 按年份继续扫描。师资以校级教师主页系统为主，并补充配置中已核验的院系官网名录。选择 `--max-units 0 --max-teachers-per-unit 1` 可对全部启用目录各抽样一人。
 
-师资、OpenAlex 和科技园支持使用 `--replay-cache` 以已有快照回补。附加 `--download-attachments` 时，仅关联原件会发出下载请求。科技处与扶持政策默认自动下载公开直链原件。其他来源可在对应卡片开启「自动获取原件」。
+六个采集源均支持使用 `--replay-cache` 以已有快照回补。科技处、扶持政策和 Lens 重解析时完全离线。OpenAlex 和科技园可在重解析时启用 `--download-attachments` 补下载支持的原件。科技处和扶持政策在正常采集时默认下载公开直链原件。
+
+### Lens 授权专利
+
+在 Lens.org 的账户页面申请 Patent API 免费学术访问权限。通过运行工作台或 CLI 的进程环境设置 `LENS_API_TOKEN`。继承此环境的进程可以采集，快照与日志只保存业务信息。默认按华师大中英文申请人名称检索中国授权及 Lens 标识为已授权的 PCT 记录。可在 `config/sources.yaml` 调整 `applicants` 和 `jurisdictions`。批次按公开日期保存进度，专利号与科技处公示共享去重入口。学校定时批次继续运行现有的三个来源，`run-all --scope all` 包含 Lens。[Lens API 入门](https://docs.api.lens.org/getting-started.html) · [专利查询](https://docs.api.lens.org/request-patent.html)
+
+```powershell
+$token = Read-Host 'Lens Patent API Token' -AsSecureString
+$env:LENS_API_TOKEN = [PSCredential]::new('lens', $token).GetNetworkCredential().Password
+.\.venv\Scripts\python.exe scripts\probe_sources.py --source ecnu_lens_patents
+.\.venv\Scripts\python.exe cli.py run --source ecnu_lens_patents --max-patents 100 --publication-year 2026 --sort-order desc
+.\.venv\Scripts\python.exe cli.py run --source ecnu_lens_patents --replay-cache
+```
 
 `tombstones list` 查看已删除记录的拦截键。`tombstones restore` 解除指定身份的拦截，随后可重新采集。已经成组登记的 DOI 和 OpenAlex ID 会同时解除。旧版独立登记的键可逐项解除。
 
@@ -103,13 +130,24 @@ Web 定时默认关闭。可在 **采集与调度** 开关定时、编辑五段�
 - 扶持政策来自科技园的政策和申报公告。按公开的申报截止日标注有效性，截止日缺乏明确依据时留空。原文 HTML 自动保存，公开 PDF/Word 直链进入附件归档。二维码或小程序给出的附件线索随原文和政策附件字段保留。市科委、普陀区政府与上海市政府候选网页在直连探测时返回 HTTP 403。[园区政策栏目](https://kjy.ecnu.edu.cn/47074/list.htm) · [园区信息公告](https://kjy.ecnu.edu.cn/47068/list.htm)
 - 扩展接口位于 `app/enrich.py`。后续可实现 `BaseEnricher` 并传入 `RunManager(db, enricher=...)`。扩展器只补充空字段，写入仍遵循字段级锁。当前运行器采用默认参数，采集没有大模型 API 依赖。
 
+## Excel 批量导入
+
+工作台「导入与导出」可下载四张工作表的空白标准模板，也可上传编辑过的导出工作簿。支持仅保留需导入的工作表或科研分区。科研成果可在分区表头右侧加「院系」列，师资也可直接填写「所属学院/系」。老师的内部联络手机号可填在备注。
+
+先预检文件，界面显示预计新增、更新、跳过和具体错误所在的工作表、行号及字段。确认导入后重新校验并在一个事务内写入，有错误时整批回滚。空白单元格保留已有字段。工作簿提供一组完整的章节或企业明细时，该组替换已有明细。导入的非空字段会启用字段锁。要回导较长的文本，可在导出时开启严格模式以发现超出 Excel 容量的单元格。
+
+```powershell
+.\.venv\Scripts\python.exe cli.py import --file '.\内部台账.xlsx' --dry-run
+.\.venv\Scripts\python.exe cli.py import --file '.\内部台账.xlsx' --review-status pending
+```
+
 ## 导出结构
 
 Excel 保留原字段字典的四张工作表名称、字段名和顺序。科研成果库按师资团队、专利、论文、学院项目依次分区，各有自己的字段表头。园区服务按章节展开，每行保留所属文档的信息。企业需求与年度经营明细分别展开。导出可按审核状态筛选。JSONL 保留章节和企业明细数组，可导出整库或单一科研类型。
 
 Excel 会截断超过单元格字符上限的内容，提示受影响记录数。可通过导出中心的严格模式在遇到超长文本时停止 Excel 或 ZIP 导出。ZIP 交付包含同一审核条件下的 Excel、已归档文件、UTF-8 BOM 的 `manifest.csv` 及机器可读 `manifest.json`。出现截断时，包内会附带完整记录 JSONL。
 
-导出范围选「学校侧」时，Excel 的数据集中在科研成果库工作表。学校 ZIP 还带有 `院系与采集覆盖.csv` 和 `论文院系关联.csv`，供核对组织树、各节点已有资料和论文归属。覆盖清单统计的是当前库中该节点直接关联的记录。
+导出范围选「学校侧」时，Excel 的数据集中在科研成果库工作表。学校 ZIP 还带有 `院系与采集覆盖.csv` 和 `论文院系关联.csv`。覆盖清单按节点统计直接关联的师资、论文、专利和学院项目，支持按审核状态筛选。
 
 编辑已有记录后可在「关联原件」区上传或预览文件。上传论文、专利和政策原件会回填文件名称。原件单文件上限为 50 MiB。自动下载限公开链接及配置中的域名，其他链接和获取失败状态会出现在清单中。默认数据库的文件保存在 `data/attachments`，做完整备份时同时备份数据库和原件目录。
 

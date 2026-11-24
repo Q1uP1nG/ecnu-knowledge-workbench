@@ -73,8 +73,9 @@ class BaseCollector(ABC):
     def __exit__(self, *_):
         self.client.close()
 
-    def fetch(self, url, *, params=None, data=None, headers=None, follow_redirects=True):
-        method = "GET" if data is None else "POST"
+    def fetch(self, url, *, params=None, data=None, json_body=None, headers=None, follow_redirects=True,
+              cache_response=True):
+        method = "GET" if data is None and json_body is None else "POST"
         host = urlsplit(url).netloc
         retries = self.http["retries"]
         for attempt in range(retries + 1):
@@ -85,7 +86,7 @@ class BaseCollector(ABC):
             self.host_times[host] = time.monotonic()
             retry_after = 0
             try:
-                with self.client.stream(method, url, params=params, data=data, headers=headers,
+                with self.client.stream(method, url, params=params, data=data, json=json_body, headers=headers,
                                         follow_redirects=follow_redirects) as response:
                     self.response_url = public_url(response.url)
                     chunks, size = [], 0
@@ -95,13 +96,15 @@ class BaseCollector(ABC):
                             raise FetchError("响应超出大小上限")
                         chunks.append(chunk)
                     body = b"".join(chunks)
-                    self.snapshot(self.response_url, digest([method, public_url(response.request.url), data]),
-                                  body, response.headers.get("content-type", ""), response.status_code)
+                    if cache_response:
+                        self.snapshot(self.response_url, digest([method, public_url(response.request.url), data, json_body]
+                                      if json_body is not None else [method, public_url(response.request.url), data]),
+                                      body, response.headers.get("content-type", ""), response.status_code)
                     if response.is_success:
                         return body
                     status = response.status_code
                     hint = ""
-                    if "json" in response.headers.get("content-type", ""):
+                    if cache_response and "json" in response.headers.get("content-type", ""):
                         try:
                             import json
                             payload = json.loads(body)

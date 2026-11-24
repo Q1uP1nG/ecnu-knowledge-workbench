@@ -1,19 +1,34 @@
 import json
 import re
 import unicodedata
+from datetime import datetime, timedelta, timezone
+from itertools import islice
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from bs4 import BeautifulSoup
 from sqlalchemy import func, select
 
 from ..attachments import Original
-from ..db import now, org, records
+from ..db import now, org, records, snapshots
 from ..store import Entry, Unit, descendants, sync_units, units
 from .base import BaseCollector, clean, link, preferred, text_of
 
 SCHOOL = "华东师范大学"
 ROOT_KEY = "ecnu"
-RANK = re.compile(r"特聘教授|助理教授|副教授|讲席教授|教授|青年研究员|副研究员|助理研究员|研究员|高级实验师|实验师|高级工程师|工程师|讲师|助教")
+RANK_LEVELS = (
+    ("助教",),
+    ("助理教授", "助理研究员", "讲师", "工程师", "实验师"),
+    ("青年研究员", "副教授", "副研究员", "高级工程师", "高级实验师"),
+    ("教授", "研究员"),
+    ("讲席教授", "特聘教授"),
+)
+RANK_WEIGHT = {rank: level for level, ranks in enumerate(RANK_LEVELS) for rank in ranks}
+RANK = re.compile("|".join(sorted(RANK_WEIGHT, key=len, reverse=True)))
+RANK_LABEL = re.compile(r"^(?:专业技术职务|职称)\s*[：:]\s*")
+OTHER_ROLES = re.compile(r"社会兼职|学术兼职|科研项目|代表性成果|学术成果|荣誉及奖励")
+INCIDENTAL_RANK = re.compile(
+    r"(?:曾任|曾兼任)[^，,。；;]{0,28}$|(?:兼职|客座|访问|外国人|博士后|责任|实习)\s*$"
+)
 EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", re.ASCII)
 RESEARCH = re.compile(r"研究方向|研究领域|研究兴趣|Research (?:Interests?|Areas?)", re.I)
 RESULTS = re.compile(r"代表性成果|代表性论文|代表论文|代表著作|科研成果|学术成果|Selected Publications", re.I)
@@ -48,6 +63,24 @@ def profile_key(url):
 
 def norm(name):
     return "".join(char for char in unicodedata.normalize("NFKC", name or "").casefold() if char.isalnum())
+
+
+def profile_rank(body, name):
+    for item in body.select("li"):
+        value = text_of(item)
+        if RANK_LABEL.match(value) and (rank := RANK.search(RANK_LABEL.sub("", value))):
+            return rank.group()
+    # Some departmental pages introduce the teacher and title before the biography.
+    first_lines = (text_of(node) for node in body.select("p,h1,h2,h3,h4"))
+    for line in islice(filter(None, first_lines), 2):
+        label = line.rstrip("。 ")
+        if len(label) <= 45 and (label.startswith(SCHOOL) or name and label.startswith(name) or RANK.fullmatch(label)):
+            if rank := RANK.search(label):
+                return rank.group()
+    overview = OTHER_ROLES.split(text_of(body)[:1100], maxsplit=1)[0]
+    ranks = (match.group() for match in RANK.finditer(overview)
+             if not INCIDENTAL_RANK.search(overview[max(0, match.start() - 36):match.start()]))
+    return max(ranks, key=RANK_WEIGHT.get, default=None)
 
 
 def research_keywords(research):
@@ -219,21 +252,43 @@ class FacultyCollector(BaseCollector):
         with self.ctx.db.engine.connect() as conn:
             profiles = {row["source_url"] or row["unique_key"]: row for row in conn.execute(
                 select(table).where(table.c.source_id == self.ctx.source_id)).mappings()}
-        seen = set()
-        for url, raw in self.cached("text/html"):
-            if url not in profiles or url in seen:
-                continue
+        api_ranks = {self.config["faculty_query"]: ("career", ())}
+        for site in self.config.get("department_sources", {}).values():
+            api = site.get("api", {})
+            if api.get("rank_field"):
+                api_ranks[api["url"]] = (api["rank_field"], site.get("https_hosts", ()))
+        careers, pages = {}, {}
+        for url, raw in self.cached(""):
+            if url in api_ranks:
+                rank_field, https_hosts = api_ranks[url]
+                try:
+                    items = json.loads(raw).get("data") or []
+                except (ValueError, AttributeError):
+                    continue
+                for item in items:
+                    career = clean(item.get(rank_field))
+                    target = link(url, item.get("cnUrl") or item.get("url"))
+                    if career and RANK.search(career) and target:
+                        if target.startswith("http://") and urlsplit(target).hostname in https_hosts:
+                            target = target.replace("http://", "https://", 1)
+                        careers.setdefault(profile_key(target), career)
+            elif url in profiles:
+                pages.setdefault(url, raw)
+        parsed = 0
+        for url, raw in pages.items():
             self.ctx.heartbeat()
             row = profiles[url]
             old = row["values"]
             try:
                 values = self.profile_values(BeautifulSoup(raw, "lxml"), {
-                    "title": old.get("姓名"), "career": old.get("职称")}, old.get("所属学院/系"))
+                    "title": old.get("姓名"), "career": careers.get(profile_key(url))}, old.get("所属学院/系"))
+                if not values["职称"]:
+                    values["职称"] = old.get("职称")
                 self.emit_profile(values, url, row["org_unit_id"], raw)
-                seen.add(url)
+                parsed += 1
             except Exception as exc:
                 self.ctx.failure(f"教师快照解析失败：{exc}", url)
-        self.ctx.log("info", f"本地教师快照重解析 · {len(seen)} 人")
+        self.ctx.log("info", f"本地教师快照重解析 · {parsed} 人")
 
     def collect_unit(self, unit):
         directory_url = unit["faculty_url"]
@@ -356,46 +411,77 @@ class FacultyCollector(BaseCollector):
         return unit
 
     def profiles(self, unit, items, *, department=False):
-        for row in items:
-            url = link(self.config["faculty_unit"], row.get("cnUrl"), None if department else "faculty.ecnu.edu.cn")
+        targets = [(row, link(self.config["faculty_unit"], row.get("cnUrl"),
+                             None if department else "faculty.ecnu.edu.cn")) for row in items]
+        recent = set()
+        days = self.options.get("skip_recent_days", 0)
+        if days and self.ctx.mode == "incremental":
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="microseconds")
+            faculty = records["faculty"]
+            keys = {profile_key(url) for _, url in targets if url}
+            with self.ctx.db.engine.connect() as conn:
+                known = {key: (source, updated) for key, source, updated in conn.execute(
+                    select(faculty.c.unique_key, faculty.c.source_url, faculty.c.updated_at)
+                    .where(faculty.c.unique_key.in_(keys)))}
+                recent = {key for key, (_, updated) in known.items() if updated > cutoff}
+                candidates = {url: profile_key(url) for _, url in targets if url and profile_key(url) in known}
+                for key, (url, _) in known.items():
+                    candidates[key] = key
+                    if url:
+                        candidates.setdefault(url, key)
+                recent.update(candidates[url] for url in conn.scalars(select(snapshots.c.url).where(
+                    snapshots.c.source_id == "ecnu_faculty", snapshots.c.http_status == 200,
+                    snapshots.c.url.in_(candidates), snapshots.c.last_seen_at > cutoff).distinct()))
+        for row, url in targets:
             if not url:
                 self.ctx.failure("师资目录条目缺少教师主页地址")
                 continue
+            if profile_key(url) in recent:
+                self.ctx.count("skipped")
+                continue
             try:
                 raw = self.fetch(url)
+                response_url = getattr(self, "response_url", url)
+                target = unit if department else self.canonical_unit(unit, url)
+                if urlsplit(response_url).hostname == "sso.ecnu.edu.cn":
+                    name = clean(row.get("title"))
+                    rank = RANK.search(clean(row.get("career")))
+                    self.ctx.log("info", "公开名录可见，教师详情需要登录", url)
+                    self.emit_profile({"姓名": name, "职称": rank.group() if rank else None,
+                                       "所属学院/系": target["name"]}, url, target["id"], None)
+                    continue
                 soup = BeautifulSoup(raw, "lxml")
                 if department and urlsplit(url).path == "/_redirect":
-                    canonical = getattr(self, "response_url", url)
-                    if urlsplit(canonical).hostname not in {urlsplit(url).hostname, "faculty.ecnu.edu.cn"}:
+                    if urlsplit(response_url).hostname not in {urlsplit(url).hostname, "faculty.ecnu.edu.cn"}:
                         raise ValueError("院系名录跳转到未配置的教师主页域名")
-                    url = canonical
-                target = unit if department else self.canonical_unit(unit, url)
+                    url = response_url
                 values = self.profile_values(soup, row, target["name"], department=department)
                 self.emit_profile(values, url, target["id"], raw)
             except Exception as exc:
                 self.ctx.failure(f"教师主页解析失败：{exc}", url)
 
     def emit_profile(self, values, url, unit_id, raw):
-        original = Original("page_html", url, f'{values["姓名"]}.html', raw)
+        original = Original("page_html", url, f'{values["姓名"]}.html', raw, fetchable=raw is not None)
         self.ctx.emit(Entry("faculty", profile_key(url), values, url, org_id=unit_id, attachments=(original,)))
 
     def profile_values(self, soup, row, unit_name, department=False):
         body = preferred(soup, self.selectors["profile"]) or soup
         name = clean(row.get("title")) or text_of(preferred(soup, self.selectors["name"]))
-        rank = clean(row.get("career")) or text_of(preferred(soup, self.selectors["title"]))
+        rank = clean(row.get("career"))
+        node_rank = text_of(preferred(soup, self.selectors["title"]))
+        match = RANK.search(rank) or RANK.search(node_rank)
         if department:
             title = text_of(preferred(soup, ".arti_title, .teacher-name, .news_title"))
             if title and re.fullmatch(r"[\u3400-\u9fffA-Za-z·\s（）()]{2,28}", title):
                 name = title
-            rank_match = RANK.search(rank) or RANK.search(name)
-            rank = rank_match.group() if rank_match else ""
+            match = match or RANK.search(name)
             name = re.sub(r"\s*(?:文科资深|兼职)?(?:特聘教授|助理教授|副教授|教授|助理研究员|副研究员|研究员)\s*$", "", name)
             name = re.sub(r"\s+", "", name.strip("*＊ ")) if re.search(r"[\u3400-\u9fff]", name) else name
             if len(name) < 2:
                 raise ValueError("名录未提供可核对的教师姓名")
-        match = RANK.search(rank) or RANK.search(text_of(body)[:1100])
-        title_note = None if match or not rank else f"主页职务：{rank}"
-        rank = match.group() if match else None
+        stated_role = rank or node_rank
+        rank = match.group() if match else profile_rank(body, name)
+        title_note = None if rank or not stated_role else f"主页职务：{stated_role}"
         email_node = body.select_one(self.selectors["email"])
         email = EMAIL.search(email_node.get("href", "") if email_node else text_of(body))
         research, results = self.section_values(body)

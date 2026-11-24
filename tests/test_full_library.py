@@ -1,27 +1,32 @@
+import csv
+import gzip
 import json
 import subprocess
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from textwrap import dedent
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import httpx
 from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
-from sqlalchemy import select, update
+from sqlalchemy import delete, insert, select, update
 
+import cli
 from app.attachments import Original, clean_filename, fetch_original
 from app.collectors import COLLECTORS
 from app.collectors.faculty import FacultyCollector, research_keywords
 from app.collectors.openalex import OpenAlexCollector
 from app.collectors.park import ScienceParkCollector
 from app.collectors.policies import PolicyCollector
-from app.collectors.transfer import TransferCollector
-from app.db import Database, ROOT, records, runs, sources
+from app.collectors.transfer import TransferCollector, person_names
+from app.db import Database, ROOT, digest, now, records, runs, snapshots, sources
+from app.export import school_coverage_csv
 from app.main import create_app
 from app.runner import RunManager
 from app.store import Conflict, Entry, Unit, delete_record, sync_units, units, upsert_entry
@@ -30,6 +35,7 @@ TRANSFER = "ecnu_kjc_transfer"
 POLICY = "shanghai_policies"
 PAPERS = "ecnu_openalex_papers"
 PARK = "ecnu_science_park"
+FACULTY = "ecnu_faculty"
 
 TRANSFER_PAGE = """
 <meta charset="utf-8">
@@ -73,6 +79,164 @@ class FullLibrary(unittest.TestCase):
             text=True, encoding="utf-8", timeout=15, check=True,
         )
         return json.loads(result.stdout)
+
+    def snapshot(self, conn, source, url, html):
+        raw = html.encode("utf-8")
+        stamp = now()
+        conn.execute(insert(snapshots).values(source_id=source, url=url, request_key=digest(url),
+                     content_hash=digest(html), content_gzip=gzip.compress(raw), content_type="text/html",
+                     http_status=200, fetched_at=stamp, last_seen_at=stamp))
+
+    def test_notice_cache_replays_without_requests_and_refreshes_affiliation(self):
+        sync_units(self.db, [Unit("school", "测试大学", "学校"),
+                             Unit("school-dept", "测试学院", "学院", "school")])
+        department = next(row["id"] for row in units(self.db) if row["name"] == "测试学院")
+        listing = self.db.config["sources"][TRANSFER]["listings"][0]["url"]
+        path = "/first/page.htm"
+        url = "https://kjc.ecnu.edu.cn" + path
+        html = TRANSFER_PAGE.replace('<span class="arti-update">时间：2026-06-12</span>', "")
+        html = html.replace("<tr><td>所属学院</td><td>测试学院</td></tr>", "")
+        with self.db.write() as conn:
+            self.snapshot(conn, TRANSFER, listing.replace("list.htm", "list2.htm"),
+                          f'<meta charset="utf-8"><li><span class="lby_bt"><a href="{path}">'
+                          "专利权转让公示</a></span>2026-06-12</li>")
+            self.snapshot(conn, TRANSFER, url, html)
+            self.snapshot(conn, TRANSFER, "https://sso.ecnu.edu.cn/login", "<h1>认证</h1>")
+        args = {"replay_cache": True, "download_attachments": True}
+        manager = RunManager(self.db)
+        with patch.object(TransferCollector, "fetch", side_effect=AssertionError("外网请求")) as fetch, \
+             patch("app.attachments.fetch_original", side_effect=AssertionError("原件下载")) as download:
+            first = manager.execute(TRANSFER, overrides=args)
+            self.assertEqual((first["inserted"], first["failed"]), (2, 0))
+            with self.db.write() as conn:
+                self.assertIsNone(conn.scalar(select(records["patents"].c.org_unit_id)))
+                self.assertIsNone(conn.scalar(select(records["projects"].c.org_unit_id)))
+                upsert_entry(conn, None, Entry("faculty", "teacher", {"姓名": "王一"}, "", org_id=department))
+                conn.execute(delete(snapshots).where(snapshots.c.url.like("%list2.htm")))
+            second = manager.execute(TRANSFER, overrides=args)
+            self.assertEqual((second["updated"], second["failed"]), (2, 0))
+            fetch.assert_not_called()
+            download.assert_not_called()
+        with self.db.engine.connect() as conn:
+            for kind in ("patents", "projects"):
+                table = records[kind]
+                self.assertEqual(conn.execute(select(table.c.org_unit_id, table.c.evidence_date)).one(),
+                                 (department, "2026-06-12"))
+
+    def test_policy_cache_replays_without_downloading_attachment(self):
+        url = "https://kjy.ecnu.edu.cn/example/page.htm"
+        with self.db.write() as conn:
+            self.snapshot(conn, POLICY, url, POLICY_PAGE)
+        with patch.object(PolicyCollector, "fetch", side_effect=AssertionError("外网请求")) as fetch, \
+             patch("app.attachments.fetch_original", side_effect=AssertionError("原件下载")) as download:
+            result = RunManager(self.db).execute(POLICY, overrides={"replay_cache": True, "download_attachments": True})
+            self.assertEqual((result["inserted"], result["failed"]), (1, 0))
+            fetch.assert_not_called()
+            download.assert_not_called()
+
+    def test_faculty_rank_prefers_explicit_current_title_then_highest_in_body(self):
+        collector = self.collector(FacultyCollector, FACULTY)
+        raw = '<main>1998年任助教，2001年任副教授，2008年任教授。曾兼任高级工程师。</main>'
+        page = BeautifulSoup(raw, "lxml")
+        self.assertEqual(collector.profile_values(page, {"title": "王一"}, "测试学院")["职称"], "教授")
+        self.assertEqual(collector.profile_values(page, {"title": "王一", "career": "讲师"}, "测试学院")["职称"], "讲师")
+        node = BeautifulSoup('<aside class="teacher-title">副研究员</aside>' + raw, "lxml")
+        self.assertEqual(collector.profile_values(node, {"title": "王一", "career": "教师"}, "测试学院")["职称"], "副研究员")
+        labeled = BeautifulSoup('<main><li>专业技术职务：副教授</li>兼任另一所大学客座教授。</main>', "lxml")
+        self.assertEqual(collector.profile_values(labeled, {"title": "王一"}, "测试学院")["职称"], "副教授")
+        biography = BeautifulSoup('<main><p>王一，测试学院讲师，曾任另一所大学青年研究员。</p>'
+                                  '<h3>社会兼职</h3>研究院特聘教授</main>', "lxml")
+        self.assertEqual(collector.profile_values(biography, {"title": "王一"}, "测试学院")["职称"], "讲师")
+
+    def test_faculty_auth_redirect_keeps_public_roster_without_archiving_login(self):
+        collector = self.collector(FacultyCollector, FACULTY)
+        collector.response_url = "https://sso.ecnu.edu.cn/login"
+        unit = {"id": 1, "name": "测试学院"}
+        url = "https://faculty.ecnu.edu.cn/_s16/demo/main.psp"
+        collector.ctx.log = lambda *_: None
+        with patch.object(collector, "fetch", return_value=b"<h1>Login</h1>"), \
+             patch.object(collector.ctx, "emit", create=True) as emit:
+            collector.profiles(unit, [{"cnUrl": url, "title": "王一", "career": "讲师"}], department=True)
+        entry = emit.call_args.args[0]
+        self.assertEqual(entry.values, {"姓名": "王一", "职称": "讲师", "所属学院/系": "测试学院"})
+        self.assertFalse(entry.attachments[0].fetchable)
+        self.assertIsNone(entry.attachments[0].content)
+
+    def test_faculty_recent_profile_skips_only_incrementally(self):
+        collector = self.collector(FacultyCollector, FACULTY)
+        collector.options["skip_recent_days"] = 7
+        collector.ctx.mode = "incremental"
+        collector.ctx.count = Mock()
+        collector.ctx.emit = Mock()
+        recent = "https://faculty.ecnu.edu.cn/_s16/recent/main.psp"
+        old = "https://faculty.ecnu.edu.cn/_s16/old/main.psp"
+        recent_alias = recent.replace("/main.psp", "/list.psp?ref=department")
+        with self.db.write() as conn:
+            upsert_entry(conn, FACULTY, Entry("faculty", recent, {"姓名": "王一"}, recent))
+            upsert_entry(conn, FACULTY, Entry("faculty", old, {"姓名": "李二"}, old))
+            expired = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+            conn.execute(update(records["faculty"]).where(records["faculty"].c.unique_key == old).values(updated_at=expired))
+        rows = [{"cnUrl": recent_alias, "title": "王一"}, {"cnUrl": old, "title": "李二"}]
+        unit = {"id": 1, "name": "测试学院"}
+        with patch.object(collector, "fetch", return_value=b"<main>Details</main>") as fetch:
+            collector.profiles(unit, rows, department=True)
+            fetch.assert_called_once_with(old)
+            collector.ctx.count.assert_called_once_with("skipped")
+            fetch.reset_mock()
+            collector.ctx.count.reset_mock()
+            collector.ctx.mode = "full"
+            collector.profiles(unit, rows, department=True)
+            self.assertEqual(fetch.call_args_list, [call(recent_alias), call(old)])
+            collector.ctx.count.assert_not_called()
+
+    def test_run_all_school_cli_continues_after_conflict_and_exception(self):
+        manager = Mock()
+        manager.execute.side_effect = [
+            Conflict("此来源正在采集"), RuntimeError("临时异常"),
+            {"id": 1, "status": "succeeded", "skipped": 3, "failed": 0},
+        ]
+        arguments = ["cli.py", "--db", str(self.path), "run-all", "--scope", "school",
+                     "--skip-recent-days", "7", "--no-download-attachments"]
+        with patch.object(cli, "RunManager", return_value=manager), patch.object(sys, "argv", arguments), \
+             patch.object(sys, "stdout", new_callable=StringIO) as output:
+            self.assertEqual(cli.main(), 1)
+            report = json.loads(output.getvalue())
+        self.assertEqual(manager.execute.call_args_list, [
+            call(FACULTY, "incremental", overrides={"skip_recent_days": 7}),
+            call(PAPERS, "incremental", overrides={"download_attachments": False}),
+            call(TRANSFER, "incremental", overrides={"download_attachments": False}),
+        ])
+        self.assertEqual([source["source_id"] for source in report["sources"]], [FACULTY, PAPERS, TRANSFER])
+        self.assertEqual([source["status"] for source in report["sources"]], ["conflict", "failed", "succeeded"])
+        self.assertEqual((report["failed"], report["skipped"]), (2, 3))
+
+    def test_transfer_cleans_names_without_splitting_latin_surname(self):
+        self.assertEqual(person_names(" 王 一；李二, 张三 /王一", " YU, Jiahui, LU, Wei, YU, Jiahui"),
+                         ("王一", "李二", "张三", "YU, Jiahui", "LU, Wei"))
+        html = TRANSFER_PAGE.replace("王一、李二", "王一 ； 李二，YU, Jiahui / 王一")
+        html = html.replace("现对王一负责的", "现就").replace("公示-王一", "公示")
+        project, patent = self.collector(TransferCollector, TRANSFER).entries(
+            "https://kjc.ecnu.edu.cn/name/page.htm", html.encode("utf-8"), ""
+        )
+        for value in (project.values["负责人"], patent.values["发明人"]):
+            self.assertEqual(value, "王一、李二、YU, Jiahui")
+
+    def test_school_coverage_has_direct_patent_and_project_counts(self):
+        sync_units(self.db, [Unit("school", "学校", "学校"), Unit("school-dept", "测试学院", "学院", "school")])
+        department = next(row["id"] for row in units(self.db) if row["name"] == "测试学院")
+        with self.db.write() as conn:
+            for kind, field, title in (("patents", "专利名称", "测试专利"), ("projects", "项目名称", "测试项目")):
+                upsert_entry(conn, None, Entry(kind, title, {field: title}, "", org_id=department))
+            conn.execute(update(records["projects"]).values(review_status="approved"))
+            full = csv.DictReader(StringIO(school_coverage_csv(conn, None).decode("utf-8-sig")))
+            self.assertEqual(full.fieldnames, ["院系ID", "上级院系ID", "院系路径", "类型", "官网", "教师目录",
+                             "自身启用", "本节点师资条数", "本节点论文条数", "本节点专利条数", "本节点学院项目条数",
+                             "最近尝试采集时间（UTC）"])
+            parent, child = list(full)
+            self.assertEqual((parent["本节点专利条数"], parent["本节点学院项目条数"]), ("0", "0"))
+            self.assertEqual((child["本节点专利条数"], child["本节点学院项目条数"]), ("1", "1"))
+            pending = list(csv.DictReader(StringIO(school_coverage_csv(conn, "pending").decode("utf-8-sig"))))[1]
+            self.assertEqual((pending["本节点专利条数"], pending["本节点学院项目条数"]), ("1", "0"))
 
     def test_transfer_table_and_public_number_deduplicate(self):
         sync_units(self.db, [Unit("school", "测试大学", "学校"),

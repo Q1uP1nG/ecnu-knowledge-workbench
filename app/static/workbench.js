@@ -5,7 +5,7 @@ const pages = {
   units: { label: "院系架构", title: "华东师大院系架构", description: "维护院系层级，查看师资与关联科研成果。", icon: "M12 7v5m-7 5v-5h14v5M9 3h6v4H9zM2 17h6v4H2zm14 0h6v4h-6z" },
   sources: { label: "采集与调度", title: "采集与调度", description: "配置采集范围与定时计划，查看每次任务的运行日志。", icon: "M12 8v4l3 2m6-2a9 9 0 1 1-9-9m5 0h4v4m0-4-5 5" },
   library: { label: "知识库", title: "知识库数据工作台", description: "检索和审核采集记录，补充原始来源没有提供的字段。", icon: "M4 4h6a2 2 0 0 1 2 2v14a4 4 0 0 0-4-2H3V5a1 1 0 0 1 1-1zm16 0h-6a2 2 0 0 0-2 2v14a4 4 0 0 1 4-2h5V5a1 1 0 0 0-1-1z" },
-  export: { label: "导出中心", title: "导出中心", description: "按审核状态下载 Excel、JSONL 或含原件的 ZIP。", icon: "M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5" },
+  export: { label: "导入与导出", title: "导入与导出", description: "预检并导入 Excel，或按审核状态导出知识库。", icon: "M12 3v12m-4-4 4 4 4-4M4 15v5h16v-5" },
 };
 const libraries = [
   { id: "services", label: "园区服务知识库", icon: "M5 3h10l4 4v14H5zm9 0v5h5M8 12h8m-8 4h8" },
@@ -19,6 +19,7 @@ const sourceLabels = {
   ecnu_science_park: "华东师大国家大学科技园",
   ecnu_kjc_transfer: "华东师大科技处 · 专利与成果转化",
   shanghai_policies: "扶持政策 · 科技园与上海市",
+  ecnu_lens_patents: "华东师大专利 · Lens",
 };
 const statuses = {
   pending: "待审核", approved: "已通过", ignored: "已忽略",
@@ -61,6 +62,7 @@ Vue.createApp({
       library: "services", kind: "services", query: "", review: "", reviews: ["pending", "approved", "ignored"],
       offset: 0, records: blankList(), exportKind: "services", exportReview: "", exportScope: "all",
       selectedRecords: [], appliedFilter: {}, strictExport: false,
+      importFile: null, importReview: "pending", importResult: null, importBusy: false, importError: "",
       originals: [], uploading: false,
       metrics: [{ id: "inserted", label: "新增" }, { id: "updated", label: "更新" }, { id: "failed", label: "失败" }],
       selectedMetric: "inserted", selectedDay: "", modal: "", modalTitle: "", modalError: "", editKind: "",
@@ -69,8 +71,9 @@ Vue.createApp({
         max_units: "院系数量上限", max_teachers_per_unit: "每院系人数上限", max_papers: "论文数量上限",
         publication_year: "发表年份", sync_strategy: "论文增量策略", from_updated_date: "更新日期起点",
         max_news_pages: "新闻列表页数上限", max_news_items: "新闻篇数上限",
-        max_notices: "成果公示篇数上限", max_policies: "政策篇数上限",
-        sort_order: "论文排序", download_attachments: "自动获取原件",
+        skip_recent_days: "跳过近期已采天数", max_patents: "专利数量上限",
+        max_notices: "公示数量上限", max_policies: "政策数量上限", from_date: "公开日期起点",
+        sort_order: "公开日期排序", download_attachments: "自动获取原件",
       },
     };
   },
@@ -453,6 +456,37 @@ Vue.createApp({
         await this.loadUnits();
         this.showNotice("已移除院系节点");
       } catch (err) { this.modalError = err.message; }
+    },
+    chooseImportFile(file) {
+      if (this.importBusy) return;
+      this.importResult = null;
+      this.importError = file && !/\.xlsx$/i.test(file.name) ? "请选择 .xlsx 工作簿" : "";
+      this.importFile = this.importError ? null : file;
+    },
+    async submitImport(dryRun) {
+      if (!this.importFile || this.importBusy) return;
+      this.importBusy = true;
+      this.importError = "";
+      this.importResult = null;
+      try {
+        const body = new FormData();
+        body.append("file", this.importFile);
+        body.append("dry_run", String(dryRun));
+        body.append("review_status", this.importReview);
+        const response = await fetch("/api/import/xlsx", { method: "POST", body });
+        const result = await response.json();
+        if (!response.ok) throw new Error(Array.isArray(result.detail)
+          ? result.detail.map(item => item.msg).join("；") : result.detail || "导入请求失败");
+        this.importResult = result;
+        if (result.committed) {
+          this.showNotice("Excel 导入成功");
+          await this.loadDashboard();
+        }
+      } catch (err) {
+        this.importError = err.message;
+      } finally {
+        this.importBusy = false;
+      }
     },
     async download(path) {
       this.error = "";

@@ -231,6 +231,43 @@
       </template>
 
       <template v-if="page === 'export'">
+        <section class="panel" @dragover.prevent @drop.prevent="chooseImportFile($event.dataTransfer.files[0])">
+          <div class="panel-head">
+            <div><h2>Excel 批量导入</h2><p>选择或拖入模板工作簿，也可将修改后的导出文件导回。空白字段保留原值。</p></div>
+            <a class="button" href="/api/import/template" download>下载标准模板</a>
+          </div>
+          <div class="export-body">
+            <label class="form-field">Excel 工作簿<input type="file" accept=".xlsx" :disabled="importBusy"
+              @change="chooseImportFile($event.target.files[0]); $event.target.value = ''"></label>
+            <p v-if="importFile">{{ importFile.name }}</p>
+            <label class="inline-field">导入后审核状态
+              <select v-model="importReview" :disabled="importBusy" @change="importResult = null">
+                <option value="pending">待审核</option><option value="approved">已通过</option>
+              </select>
+            </label>
+            <div class="actions">
+              <button class="button" :disabled="!importFile || importBusy" @click="submitImport(true)">预检文件</button>
+              <button class="button primary" :disabled="importBusy || !importResult?.dry_run || !!importResult.errors.length"
+                @click="submitImport(false)">确认导入</button>
+            </div>
+            <p v-if="importBusy" role="status">正在处理工作簿…</p>
+            <p v-if="importError" role="alert">{{ importError }}</p>
+            <div v-if="importResult" aria-live="polite">
+              <p>{{ importResult.committed ? '导入完成' : importResult.errors.length ? '有错误，工作库未写入' : '预检通过，等待确认' }}</p>
+              <table>
+                <thead><tr><th>记录类别</th><th>新增</th><th>更新</th><th>跳过</th></tr></thead>
+                <tbody><tr v-for="(counts, id) in importResult.tables" :key="id">
+                  <td>{{ schema[id]?.label || id }}</td><td>{{ counts.will_insert }}</td><td>{{ counts.will_update }}</td><td>{{ counts.will_skip }}</td>
+                </tr></tbody>
+              </table>
+              <ul v-if="importResult.errors.length">
+                <li v-for="(issue, index) in importResult.errors" :key="index">
+                  {{ [issue.sheet, issue.row ? '第 ' + issue.row + ' 行' : '', issue.field, issue.message].filter(Boolean).join(' · ') }}
+                </li>
+              </ul>
+            </div>
+          </div>
+        </section>
         <section class="panel export-filter">
           <div class="panel-head"><div><h2>导出范围</h2></div></div>
           <label class="inline-field">Excel 与 ZIP<select v-model="exportScope"><option value="all">全库</option><option value="school">学校侧</option></select></label>
@@ -333,7 +370,7 @@
             <select v-if="key === 'sync_strategy'" v-model="draft.options[key]"><option value="publication">发表日期</option><option value="updated">更新日期（Daily Sync）</option></select>
             <select v-else-if="key === 'sort_order'" v-model="draft.options[key]"><option value="desc">最新在前</option><option value="asc">最早在前</option></select>
             <input v-else-if="key === 'download_attachments'" type="checkbox" v-model="draft.options[key]">
-            <input v-else-if="key === 'from_updated_date'" type="date" v-model="draft.options[key]">
+            <input v-else-if="key === 'from_updated_date' || key === 'from_date'" type="date" v-model="draft.options[key]">
             <input v-else type="number" min="0" v-model.number="draft.options[key]">
           </label>
           <p class="form-hint wide">采集数量填 0 时取消抽样上限。OpenAlex 发表年份留空时不限定年份。</p>

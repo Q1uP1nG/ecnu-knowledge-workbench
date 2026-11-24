@@ -5,9 +5,13 @@ import sys
 from app.collectors import COLLECTORS
 from app.db import Database
 from app.demo import seed
-from app.runner import RunManager
+from app.importer import import_xlsx
+from app.runner import OPTIONS, STATUS_KEYS, RunManager, options_for
 from app.schema import SPECS
-from app.store import list_tombstones, restore_tombstone
+from app.store import Conflict, list_tombstones, restore_tombstone
+
+
+SCHOOL_SOURCES = ("ecnu_faculty", "ecnu_openalex_papers", "ecnu_kjc_transfer")
 
 
 def parser():
@@ -28,14 +32,46 @@ def parser():
     run.add_argument("--unlimited", action="store_true", help="移除采集抽样限制")
     run.add_argument("--unit-id", type=int, action="append", dest="unit_ids")
     for field in ("max_units", "max_teachers_per_unit", "max_papers", "publication_year", "max_news_pages", "max_news_items",
-                  "max_notices", "max_policies"):
+                  "max_notices", "max_policies", "max_patents", "skip_recent_days"):
         run.add_argument("--" + field.replace("_", "-"), type=int)
     run.add_argument("--from-updated-date")
+    run.add_argument("--from-date", help="Lens 专利公开日期起点（YYYY-MM-DD）")
     run.add_argument("--sync-strategy", choices=("publication", "updated"))
     run.add_argument("--sort-order", choices=("asc", "desc"))
     run.add_argument("--replay-cache", action="store_true", default=None, help="使用已有原始快照重解析")
     run.add_argument("--download-attachments", action=argparse.BooleanOptionalAction, default=None)
+    batch = commands.add_parser("run-all", help="依次执行多个采集源的增量任务")
+    batch.add_argument("--scope", choices=("school", "all"), default="school")
+    for field in ("skip_recent_days", "max_units", "max_teachers_per_unit", "max_papers", "publication_year"):
+        batch.add_argument("--" + field.replace("_", "-"), type=int)
+    batch.add_argument("--download-attachments", action=argparse.BooleanOptionalAction, default=None)
+    load = commands.add_parser("import", help="预检或导入 Excel 工作簿")
+    load.add_argument("--file", required=True, metavar="PATH.xlsx")
+    load.add_argument("--dry-run", action="store_true", help="只预检，回滚所有数据库改动")
+    load.add_argument("--review-status", choices=("pending", "approved"), default="pending")
     return app
+
+
+def run_all(manager, scope, overrides):
+    selected = SCHOOL_SOURCES if scope == "school" else tuple(dict.fromkeys((*SCHOOL_SOURCES, *COLLECTORS)))
+    jobs = [(source, options_for(source, {key: value for key, value in overrides.items() if key in OPTIONS[source]}))
+            for source in selected]
+    results = []
+    for source, options in jobs:
+        try:
+            result = manager.execute(source, "incremental", overrides=options)
+        except Conflict as exc:
+            result = {"status": "conflict", "error": str(exc), "failed": 1}
+        except Exception as exc:
+            result = {"status": "failed", "error": str(exc) or type(exc).__name__, "failed": 1}
+        results.append(dict.fromkeys(STATUS_KEYS, 0) | result | {"source_id": source})
+        if result["status"] == "cancelled":
+            break
+    totals = {key: sum(item[key] for item in results) for key in STATUS_KEYS}
+    statuses = {item["status"] for item in results}
+    status = ("cancelled" if "cancelled" in statuses else
+              "failed" if totals["failed"] or statuses & {"failed", "conflict"} else "succeeded")
+    return {"scope": scope, "status": status, **totals, "sources": results}
 
 
 def main():
@@ -50,6 +86,15 @@ def main():
             if args.action == "list":
                 return {"tombstones": list_tombstones(db, args.kind)}
             return {"restored": restore_tombstone(db, args.kind, args.key)}
+        if args.command == "run-all":
+            overrides = {name: value for name, value in vars(args).items()
+                         if name not in {"db", "command", "scope"} and value is not None}
+            return run_all(RunManager(db), args.scope, overrides)
+        if args.command == "import":
+            if not args.file.lower().endswith(".xlsx"):
+                raise ValueError("请选择 .xlsx 工作簿")
+            with open(args.file, "rb") as stream:
+                return import_xlsx(db, stream, dry_run=args.dry_run, review_status=args.review_status)
         options = {k: v for k, v in vars(args).items()
                    if v is not None and k not in {"db", "command", "source", "mode", "dry_run", "unlimited"}}
         return RunManager(db).execute(args.source, args.mode, overrides=options,
@@ -70,7 +115,8 @@ def main():
         finally:
             db.engine.dispose()
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 130 if result.get("status") == "cancelled" else 1 if result.get("failed") else 0
+    status = result.get("status")
+    return 130 if status == "cancelled" else 1 if result.get("failed") or status == "failed" else 0
 
 
 if __name__ == "__main__":

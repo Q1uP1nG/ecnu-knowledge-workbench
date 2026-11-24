@@ -5,17 +5,22 @@ from collections import defaultdict
 from sqlalchemy import select
 
 from ..db import org, records
+from ..patent_identity import patent_key
 from ..store import Entry
 from .base import clean, text_of
 from .notices import NoticeCollector, article_lines
 
 NUMBER = re.compile(r"(?i)(?<![A-Z0-9])(?:(?:ZL|CN)\s*)?(?:\d{12}\s*\.\s*[\dX]|\d{8}\s*\.\s*[\dX]|\d{12})(?![\d.])")
+PUBLICATION_NUMBER = re.compile(r"(?i)(?<![A-Z0-9])(?:CN\s*)?\d{6,11}\s*(?:[ABCUYS]\d?)?(?![\d.])")
 FOREIGN_NUMBER = re.compile(r"\d{2}/\d{3},\d{3}|\d{8}\.\d")
-PEOPLE = re.compile(r"[、，,；;／/]+")
+PERSON_SEPARATOR = re.compile(r"[、，；;／/]+")
+LATIN_SURNAME = re.compile(r"[A-Z][A-Za-z'’\-]+")
+LATIN_GIVEN = re.compile(r"[A-Za-z][A-Za-z.'’\-]*(?: [A-Za-z][A-Za-z.'’\-]*){0,2}")
 INLINE_PATENT = re.compile(r"^(?:\d+\s*[、.]\s*)?(.{3,220}?)\s*[（(]([^）)]{5,95})[）)]\s*[,，]?\s*(发明专利|实用新型(?:专利)?|外观设计(?:专利)?)")
 FIELDS = {
     "name": r"(?:专利(?:成果)?名称|(?:成果|成名)名称|成果完成(?=\d)|技术(?:成果)?名称)",
     "number": r"(?:专利(?:申请)?(?:号|编号)|申请(?:号|编号))",
+    "publication": r"(?:公开号|公布号|公告号|授权公告号|申请公布号)",
     "people": r"(?:成果)?(?:完成人|发明人|设计人)",
     "type": r"(?:专利|成果)类型",
     "summary": r"(?:技术(?:摘要|说明|简介)|(?:科技)?成果简介|专利摘要)",
@@ -46,7 +51,7 @@ def label_key(label):
 
 def notice_fields(article, lines):
     items, common = [], {}
-    item_fields = {"name", "number", "people", "type", "summary", "status", "year", "unit"}
+    item_fields = {"name", "number", "publication", "people", "type", "summary", "status", "year", "unit"}
     for table in article.select("table"):
         rows = [[text_of(cell) for cell in row.find_all(["th", "td"], recursive=False)]
                 for row in table.select("tr") if row.find_parent("table") is table]
@@ -87,38 +92,62 @@ def patent_number(item):
     match = NUMBER.search(field)
     if not match and (item.get("number") or re.search(r"欧洲|美国|申请号", field)):
         match = FOREIGN_NUMBER.search(field)
+    if not match and item.get("number"):
+        match = PUBLICATION_NUMBER.fullmatch(field.strip())
     return re.sub(r"\s+", "", match.group()).upper() if match else ""
 
 
-def patent_key(name, number):
-    if number:
-        return "patent:" + re.sub(r"^(?:ZL|CN)", "", number)
-    return "title:" + re.sub(r"\W+", "", unicodedata.normalize("NFKC", name)).casefold()
+def person_names(*values):
+    names = {}
+    for value in values:
+        for group in PERSON_SEPARATOR.split(value or ""):
+            parts = [part for text in group.split(",") if (part := clean(text))]
+            index = 0
+            while index < len(parts):
+                name = parts[index]
+                index += 1
+                if (index < len(parts) and LATIN_SURNAME.fullmatch(name)
+                        and LATIN_GIVEN.fullmatch(parts[index])
+                        and (name.isupper() or len(parts) % 2 == 0)):
+                    name += ", " + parts[index]
+                    index += 1
+                elif re.fullmatch(r"[\u3400-\u9fff· ]+", name):
+                    name = name.replace(" ", "")
+                names.setdefault(unicodedata.normalize("NFKC", name).casefold(), name)
+    return tuple(names.values())
+
+
+def patent_affiliation(db, text, people, *, fallback=""):
+    faculty = records["faculty"]
+    with db.engine.connect() as conn:
+        units = {name: unit_id for unit_id, name in conn.execute(
+            select(org.c.id, org.c.name).where(org.c.archived.is_(False)))}
+        mentioned = {name for name in units if name != "华东师范大学" and name in text}
+        specific = {name for name in mentioned if not any(name != other and name in other for other in mentioned)}
+        if specific:
+            return units[next(iter(specific))] if len(specific) == 1 else None
+        names = set(person_names(people))
+        alternate_names = set(person_names(fallback))
+        column = faculty.c["values"]["姓名"].as_string()
+        matches = defaultdict(list)
+        for name, unit_id in conn.execute(select(column, faculty.c.org_unit_id).where(column.in_(names | alternate_names))):
+            matches[name].append(unit_id)
+    unique = {ids[0] for name in names if len(ids := matches[name]) == 1 and ids[0] in units.values()}
+    if not unique:
+        unique = {ids[0] for name in alternate_names if len(ids := matches[name]) == 1 and ids[0] in units.values()}
+    return next(iter(unique)) if len(unique) == 1 else None
 
 
 class TransferCollector(NoticeCollector):
     cap_option = "max_notices"
+    record_kinds = ("projects", "patents")
 
     def matches(self, title, listing):
         return "公示" in title and bool(re.search(
             r"专利|成果赋权|成果转化|产学研|作价", title))
 
-    def affiliation(self, text, people):
-        faculty = records["faculty"]
-        with self.ctx.db.engine.connect() as conn:
-            units = {name: unit_id for unit_id, name in conn.execute(
-                select(org.c.id, org.c.name).where(org.c.archived.is_(False)))}
-            mentioned = {name for name in units if name != "华东师范大学" and name in text}
-            specific = {name for name in mentioned if not any(name != other and name in other for other in mentioned)}
-            if specific:
-                return units[next(iter(specific))] if len(specific) == 1 else None
-            names = {name.strip() for name in PEOPLE.split(people or "") if name.strip()}
-            column = faculty.c["values"]["姓名"].as_string()
-            matches = defaultdict(list)
-            for name, unit_id in conn.execute(select(column, faculty.c.org_unit_id).where(column.in_(names))):
-                matches[name].append(unit_id)
-        unique = {ids[0] for ids in matches.values() if len(ids) == 1 and ids[0] in units.values()}
-        return next(iter(unique)) if len(unique) == 1 else None
+    def affiliation(self, text, people, *, fallback=""):
+        return patent_affiliation(self.ctx.db, text, people, fallback=fallback)
 
     def entries(self, url, raw, listing_date):
         title, article, published, originals = self.parts(url, raw, listing_date)
@@ -134,9 +163,10 @@ class TransferCollector(NoticeCollector):
             responsible = re.sub(r"\s+", "", match[1]) if match else ""
         if not responsible and "公示-" in title:
             responsible = re.split(r"[（(]", title.rsplit("公示-", 1)[1])[0].strip()
-        people = "、".join(dict.fromkeys(item["people"] for item in items if item.get("people")))
+        responsible = "、".join(person_names(responsible))
+        people = "、".join(person_names(*(item.get("people") for item in items)))
         body = text_of(article)
-        project_org = self.affiliation(common.get("unit") or body, "、".join(filter(None, (responsible, people))))
+        project_org = self.affiliation(common.get("unit") or body, responsible or people, fallback=people if responsible else "")
         partner = common.get("partner")
         if not partner and (match := re.search(
             r"(?:转让给|转让予|许可给|作价入股至)\s*([^、。；，]{2,50}?(?:有限公司|研究院))", body
@@ -162,6 +192,8 @@ class TransferCollector(NoticeCollector):
             if not name:
                 continue
             number = patent_number(item)
+            publication = patent_number({"name": "", "number": item.get("publication")})
+            number = number or publication
             if "现金奖励" in title and not number:
                 continue
             if re.search(r"软件著作权|软件版权|计算机软件", name) and not number:
@@ -182,10 +214,11 @@ class TransferCollector(NoticeCollector):
             else:
                 status = ""
             year = re.search(r"20\d{2}", item.get("year", ""))
-            inventors = item.get("people")
+            inventors = "、".join(person_names(item.get("people")))
             unit = self.affiliation(item.get("unit") or common.get("unit") or body, inventors or responsible)
             yield Entry("patents", patent_key(name, number), {
                 "专利名称": name, "专利号": number, "专利类型": kind, "发明人": inventors,
                 "技术摘要": item.get("summary") or common.get("summary"), "法律状态": status,
                 "授权年份": int(year[0]) if year else None, "原始文件名": originals[0].filename,
-            }, url, org_id=unit, evidence_date=published, attachments=originals)
+            }, url, org_id=unit, evidence_date=published, attachments=originals,
+                aliases=(patent_key("", publication),) if publication and publication != number else ())

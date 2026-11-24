@@ -14,6 +14,17 @@ http:
   backoff_seconds: 1.0
   max_response_bytes: 12000000
 sources:
+  ecnu_lens_patents:
+    label: 华东师大专利 · Lens
+    cron: "20 4 * * 6"
+    url: https://api.lens.org/patent/search
+    applicants: [East China Normal University, 华东师范大学]
+    jurisdictions: [CN, WO]
+    options:
+      max_patents: 100
+      publication_year: null
+      from_date: null
+      sort_order: desc
   ecnu_faculty:
     label: 华东师大师资与院系
     cron: "20 3 * * 1"
@@ -182,7 +193,7 @@ sources:
       大夏书院: [Daxia College, Da Xia College]
       光华书院: [Guanghua College]
       国家教育宏观政策研究院: [National Institute of Education Policy and Management, National Institute of Education Macro-Policy]
-      上海终身教育研究院: [Shanghai Institute for Lifelong Education, Shanghai Institute of Lifelong Education]
+      上海终身教育研究院: [Shanghai Institute for Lifelong Education, Shanghai Institute of Lifelong Education, Shanghai Municipal Institute for Lifelong Education]
       城市发展研究院: [Institute for Urban Development, Institute of Urban Development, Center for Urban Development Studies]
       社会主义历史与文献研究院: [Institute of Socialist History and Literature]
       上海人工智能金融学院: [Shanghai Advanced Institute of Artificial Intelligence and Finance, Shanghai AI Finance Institute]
@@ -192,21 +203,22 @@ sources:
       脑科学与教育创新研究院: [Institute of Brain Science and Educational Innovation, Institute of Brain and Education Innovation]
       医学与健康研究院: [Institute of Medical and Health Sciences, Institute of Medicine and Health]
       产业技术研究院: [Institute of Industrial Technology]
-      人工智能新药创智中心: [Center for Artificial Intelligence Driven Drug Discovery]
+      人工智能新药创智中心: [Center for Artificial Intelligence Driven Drug Discovery, Innovation Center for AI and Drug Discovery]
       网络空间安全研究院: [Institute of Cyber Security, Institute of Cybersecurity]
       量子科学与精密测量研究院: [Institute of Quantum Science and Precision Measurement, Institute of Quantum Science and Precision Metrology]
       人文社会科学学院: [School of Humanities and Social Sciences]
-      上海智能教育研究院: [Shanghai Institute of Intelligent Education, Shanghai Institute of Smart Education]
+      上海智能教育研究院: [Shanghai Institute of Intelligent Education, Shanghai Institute of Smart Education, Shanghai Institute of AI for Education]
       脑功能基因组学教育部重点实验室: [Key Laboratory of Brain Functional Genomics, Key Laboratory of Brain Functional Genomics Ministry of Education]
       转化科学与技术联合研究院: [Joint Institute of Translational Science and Technology]
       统计学院: [School of Statistics, School of Statistical Sciences]
       地理科学学院: [School of Geographic Sciences, School of Geographical Sciences]
-      生态与环境科学学院: [School of Ecology and Environmental Sciences, School of Ecological and Environmental Sciences]
+      生态与环境科学学院: [School of Ecology and Environmental Sciences, School of Ecological and Environmental Sciences, School of Ecology & Environmental Science]
       河口海岸科学研究院（海洋科学学院）: [Institute of Estuarine and Coastal Research, School of Marine Sciences]
       计算机科学与技术学院: [School of Computer Science & Technology, Department of Computer Science and Technology]
-      软件工程学院: [School of Software, School of Software Engineering]
+      软件工程学院: [School of Software, School of Software Engineering, Software Engineering Institute]
       数据科学与工程学院: [School of Data Science & Engineering, School of Data Science and Engineering]
-      信息与电子工程学院（集成电路科学与工程学院）: [School of Information and Electronic Engineering, School of Information Science and Electronic Engineering, School of Communication and Electronic Engineering, School of Integrated Circuit Science and Engineering]
+      信息与电子工程学院（集成电路科学与工程学院）: [School of Information and Electronic Engineering, School of Information Science and Electronic Engineering, School of Communication and Electronic Engineering, School of Integrated Circuit Science and Engineering, School of Integrated Circuits]
+      公共管理学院: [School of Public Management]
   ecnu_openalex_papers:
     label: 华东师大论文 · OpenAlex
     cron: "10 4 * * *"

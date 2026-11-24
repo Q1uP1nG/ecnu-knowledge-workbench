@@ -1,4 +1,5 @@
 from .faculty import FacultyCollector
+from .lens_patents import LensPatentCollector
 from .openalex import OpenAlexCollector
 from .park import ScienceParkCollector
 from .policies import PolicyCollector
@@ -10,4 +11,5 @@ COLLECTORS = {
     "ecnu_science_park": ScienceParkCollector,
     "ecnu_kjc_transfer": TransferCollector,
     "shanghai_policies": PolicyCollector,
+    "ecnu_lens_patents": LensPatentCollector,
 }

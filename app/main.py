@@ -17,6 +17,7 @@ from .collectors import COLLECTORS
 from .db import ROOT, Database, attachments, logs, org, records, runs, snapshots, sources
 from .demo import seed
 from .export import GROUPS, SCHOOL_WORKBOOK_NAME, WORKBOOK_NAME, bundle_file, excel_file, json_lines
+from .importer import TEMPLATE_NAME, import_xlsx, template_xlsx
 from .runner import RunManager, Scheduler, cron_trigger, options_for
 from .schema import REVIEW, SPECS, catalog
 from .store import Conflict, batch_review, delete_record, descendants, list_records, local_date, save_record, unit_links, units
@@ -336,6 +337,22 @@ def create_app(db_path=None):
         return FileResponse(path, filename=file["filename"], media_type=file["mime_type"] if preview else "application/octet-stream",
                             content_disposition_type="inline" if preview else "attachment",
                             headers={"X-Content-Type-Options": "nosniff"})
+
+    @app.get("/api/import/template")
+    def import_template():
+        return Response(template_xlsx(),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers=attachment(TEMPLATE_NAME))
+
+    @app.post("/api/import/xlsx")
+    def import_workbook(file: UploadFile = File(...), dry_run: bool = Form(True),
+                        review_status: str = Form("pending")):
+        try:
+            if not (file.filename or "").lower().endswith(".xlsx"):
+                raise ValueError("请选择 .xlsx 工作簿")
+            return import_xlsx(app.state.db, file.file, dry_run=dry_run, review_status=review_status)
+        finally:
+            file.file.close()
 
     @app.get("/api/export/xlsx")
     def export_xlsx(review: str | None = None, strict: bool = False, scope: str = "all"):

@@ -21,13 +21,16 @@ from .store import Conflict, upsert_entry
 
 STATUS_KEYS = ("inserted", "updated", "skipped", "failed")
 OPTIONS = {
-    "ecnu_faculty": {"max_units": (0, 1000), "max_teachers_per_unit": (0, 10000)},
+    "ecnu_faculty": {"max_units": (0, 1000), "max_teachers_per_unit": (0, 10000),
+                     "skip_recent_days": (0, 3650)},
     "ecnu_openalex_papers": {"max_papers": (0, 200000), "publication_year": (1600, 2200),
                              "sync_strategy": ("publication", "updated"), "sort_order": ("asc", "desc"),
                              "from_updated_date": None, "download_attachments": bool},
     "ecnu_science_park": {"max_news_pages": (0, 250), "max_news_items": (0, 25000), "download_attachments": bool},
     "ecnu_kjc_transfer": {"max_notices": (0, 1000), "download_attachments": bool},
     "shanghai_policies": {"max_policies": (0, 1000), "download_attachments": bool},
+    "ecnu_lens_patents": {"max_patents": (0, 200000), "publication_year": (1900, 2200),
+                          "from_date": None, "sort_order": ("asc", "desc")},
 }
 
 class Cancelled(InterruptedError):
@@ -48,7 +51,7 @@ def options_for(source_id, raw, *, scoped=False):
             result[key] = bool(value)
         elif key not in allowed:
             raise ValueError(f"未知采集参数：{key}")
-        elif key == "from_updated_date":
+        elif key in {"from_updated_date", "from_date"}:
             if value:
                 result[key] = date.fromisoformat(str(value)).isoformat()
             else:
@@ -215,7 +218,8 @@ class RunManager:
         run_id, started = (None, now()) if dry_run else (claim or self.claim(source_id, mode, trigger))
         ctx = RunContext(self, source, run_id, started, mode, options, dry_run)
         start = time.monotonic()
-        fatal = interrupted = False
+        fatal_error = None
+        interrupted = False
         try:
             ctx.log("info", f"开始{ '增量' if mode == 'incremental' else '全量' }采集" + (" · dry-run" if dry_run else ""))
             try:
@@ -224,11 +228,11 @@ class RunManager:
             except Cancelled:
                 raise
             except Exception as exc:
-                fatal = True
-                ctx.failure(str(exc) or type(exc).__name__)
+                fatal_error = (str(exc) or type(exc).__name__)[:2000]
+                ctx.failure(fatal_error)
         except (Cancelled, KeyboardInterrupt):
             interrupted = True
-        status = ("cancelled" if interrupted else "failed" if fatal else
+        status = ("cancelled" if interrupted else "failed" if fatal_error else
                   "partial" if ctx.counts["failed"] or ctx.partial else "succeeded")
         elapsed = round((time.monotonic() - start) * 1000)
         summary = (f'新增 {ctx.counts["inserted"]} · 更新 {ctx.counts["updated"]} · '
@@ -254,6 +258,7 @@ class RunManager:
                         timestamps["last_synced_at"] = stamp
                     conn.execute(update(sources).where(sources.c.id == source_id).values(**timestamps))
         return {"id": run_id, "status": status, "elapsed_ms": elapsed, **ctx.counts,
+                **({"error": fatal_error} if fatal_error else {}),
                 **({"logs": ctx.messages} if dry_run else {})}
 
 

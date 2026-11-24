@@ -175,7 +175,7 @@ class PhaseTwo(unittest.TestCase):
         with ZipFile(BytesIO(response.content)) as archive:
             self.assertIn("院系与采集覆盖.csv", archive.namelist())
             coverage = archive.read("院系与采集覆盖.csv").decode("utf-8-sig")
-            self.assertIn("学校 / 学院,学院,,,是,1,1", coverage)
+            self.assertIn("学校 / 学院,学院,,,是,1,1,0,0,", coverage)
             links = archive.read("论文院系关联.csv").decode("utf-8-sig")
             self.assertIn("学校论文", links)
             self.assertIn("人工确定", links)
