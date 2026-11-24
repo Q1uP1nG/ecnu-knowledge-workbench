@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>华东师大科技园｜知识库工作台</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script defer src="/static/vue.global.prod.js"></script>
+  <script defer src="/static/workbench.js"></script>
+</head>
+<body>
+<div id="app" v-cloak>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 36 36" fill="none"><path d="M7 12.5 18 6l11 6.5v12L18 31 7 24.5zM7 12.5 18 19l11-6.5M18 19v12M12.5 9.25l11 6.5" stroke="currentColor" stroke-width="1.55" stroke-linejoin="round"/></svg></div>
+      <div><strong>知识库工作台</strong><small>华东师大 · 科技园</small></div>
+    </div>
+    <nav aria-label="工作台模块">
+      <button v-for="item in navigation" :key="item.id" :class="{ active: page === item.id }"
+              :aria-current="page === item.id ? 'page' : null" @click="navigate(item.id)">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path :d="item.icon"/></svg>{{ item.label }}
+      </button>
+    </nav>
+    <div class="sidebar-footer"><span class="connection"></span>本地工作台 <span>SQLite</span></div>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <span>{{ pages[page].label }}</span>
+      <span class="top-note">华东师范大学国家大学科技园</span>
+    </header>
+    <div class="workspace">
+      <header class="page-head">
+        <div><h1>{{ pages[page].title }}</h1><p>{{ pages[page].description }}</p></div>
+        <button v-if="page === 'dashboard'" class="button" @click="loadDashboard">刷新总览</button>
+        <button v-if="page === 'units'" class="button primary" @click="openUnit(null, activeUnit?.id)">新增院系</button>
+        <button v-if="page === 'library'" class="button primary" @click="openRecord(null)">新增条目</button>
+      </header>
+      <p v-if="error" role="alert" class="alert">{{ error }} <button aria-label="关闭" @click="error = ''">×</button></p>
+      <p v-if="notice" role="status" class="notice">{{ notice }}</p>
+
+      <template v-if="page === 'dashboard'">
+        <section class="stats" aria-label="知识库记录数">
+          <button class="stat" v-for="(group, index) in libraries" :key="group.id" @click="openLibrary(group.id)">
+            <span class="stat-icon" :class="'tone-' + index"><svg viewBox="0 0 24 24" aria-hidden="true"><path :d="group.icon"/></svg></span>
+            <span class="stat-name">{{ group.label }}</span>
+            <strong class="tabular-nums">{{ dashboard.groups?.[group.label] ?? '—' }}</strong>
+            <span class="stat-unit">条记录</span>
+          </button>
+        </section>
+        <div class="dashboard-grid">
+          <section class="panel chart-panel">
+            <div class="panel-head"><div><h2>近 7 天采集趋势</h2><p>按任务完成日期统计</p></div><span class="range-label">{{ trendRange }}</span></div>
+            <div class="chart-legend">
+              <button v-for="item in metrics" :aria-pressed="selectedMetric === item.id" :class="{ chosen: selectedMetric === item.id }"
+                      @click="selectedMetric = item.id"><i :class="item.id"></i>{{ item.label }}</button>
+            </div>
+            <div class="chart" v-if="dashboard.trend">
+              <div class="axis" aria-hidden="true"><span v-for="tick in chartTicks">{{ tick }}</span></div>
+              <div class="chart-main">
+                <div class="gridlines" aria-hidden="true"></div>
+                <div class="bars">
+                  <button v-for="day in dashboard.trend" :key="day.date" class="bar-slot"
+                          :title="day.date + ' · ' + metricLabel + ' ' + day[selectedMetric]"
+                          :aria-label="day.date + ' ' + metricLabel + ' ' + day[selectedMetric]"
+                          @click="selectedDay = selectedDay === day.date ? '' : day.date">
+                    <span v-if="selectedDay === day.date" class="bar-value">{{ day[selectedMetric] }}</span>
+                    <span class="bar" :class="selectedMetric" :style="{ height: barHeight(day[selectedMetric]) }"></span>
+                    <span class="bar-date">{{ day.date.slice(5) }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <p v-if="dashboard.trend && !dashboard.recent.length" class="chart-empty">运行一次采集后，这里会显示每日统计。</p>
+          </section>
+          <section class="panel coverage">
+            <div class="panel-head"><div><h2>院系覆盖</h2><p>已采到师资的院系</p></div></div>
+            <div class="coverage-data"><strong>{{ dashboard.covered ?? '—' }}</strong><span> / {{ dashboard.eligible ?? '—' }} 个可采集院系</span></div>
+            <progress :value="dashboard.covered || 0" :max="dashboard.eligible || 1" aria-label="院系覆盖进度"></progress>
+            <div class="coverage-detail"><span>院系及机构节点</span><b>{{ dashboard.units ?? '—' }}</b></div>
+            <div class="coverage-detail"><span>原始响应快照</span><b>{{ dashboard.snapshots ?? '—' }}</b></div>
+            <button class="text-button" @click="navigate('units')">查看院系架构</button>
+          </section>
+        </div>
+        <section class="panel">
+          <div class="panel-head"><div><h2>最近采集任务</h2></div><button class="text-button" @click="navigate('sources')">查看任务日志</button></div>
+          <div class="table-scroll" v-if="dashboard.recent?.length">
+            <table><thead><tr><th>采集来源</th><th>状态</th><th>开始时间</th><th>新增</th><th>更新</th><th>失败</th></tr></thead>
+              <tbody><tr v-for="run in dashboard.recent" :key="run.id">
+                <td><button class="row-link" @click="openRun(run.id)">{{ sourceName(run.source_id) }}</button></td>
+                <td><span class="badge" :class="runStatus(run)">{{ statusName(runStatus(run)) }}</span></td>
+                <td>{{ formatTime(run.started_at) }}</td><td>{{ run.inserted }}</td><td>{{ run.updated }}</td><td>{{ run.failed }}</td>
+              </tr></tbody></table>
+          </div>
+          <div v-else class="empty"><p>暂无采集任务</p><button class="button" @click="navigate('sources')">选择采集来源</button><button class="text-button" @click="seedExample">载入内置示例</button></div>
+        </section>
+      </template>
+
+      <template v-if="page === 'units'">
+        <div class="units-layout">
+          <section class="panel unit-tree">
+            <div class="panel-head"><div><h2>院系目录</h2><p>{{ units.length }} 个节点</p></div></div>
+            <div v-if="units.length" class="tree-list">
+              <div v-for="unit in tree" :key="unit.id" class="tree-row" :class="{ selected: unit.id === activeUnit?.id }" :style="{ '--depth': unit.depth }">
+                <button v-if="unit.hasChildren" @click="toggleBranch(unit.id)" :aria-expanded="!collapsed[unit.id]" :aria-label="unit.name" class="branch">{{ collapsed[unit.id] ? '+' : '−' }}</button>
+                <span v-else class="tree-leaf">·</span>
+                <button class="tree-name" @click="selectUnit(unit.id)">{{ unit.name }}
+                  <small v-if="!unit.enabled">停用</small><small v-else-if="!unitEligibility.get(unit.id)">无目录</small>
+                </button>
+              </div>
+            </div>
+            <div v-else class="empty"><p>暂无院系节点</p><button class="button" @click="startRun('ecnu_faculty')">同步院系与师资</button></div>
+          </section>
+          <section class="panel unit-detail" v-if="activeUnit">
+            <div class="panel-head"><div><h2>{{ activeUnit.name }}</h2><p>{{ activeUnit.type }} · {{ activeUnit.enabled ? '参与采集' : '已停用' }}</p></div>
+              <div class="actions"><button class="button" @click="openUnit(activeUnit)">编辑</button><button class="button primary" :disabled="!unitEligibility.get(activeUnit.id)" @click="startRun('ecnu_faculty', 'incremental', false, [activeUnit.id])">立即采集</button></div>
+            </div>
+            <div class="unit-meta">
+              <a v-if="activeUnit.website_url" :href="safeLink(activeUnit.website_url)" target="_blank" rel="noreferrer">院系官网</a>
+              <a v-if="activeUnit.faculty_url" :href="safeLink(activeUnit.faculty_url)" target="_blank" rel="noreferrer">教师主页目录</a>
+              <button class="text-button" @click="toggleUnit">{{ activeUnit.enabled ? '暂停采集' : '启用采集' }}</button>
+            </div>
+            <div v-if="activeUnit.enabled && !unitEligibility.get(activeUnit.id)" class="unit-meta">
+              <span class="form-hint">当前院系没有独立教师目录，可在编辑中补充，或从归口院系采集。</span>
+              <button v-if="directoryHint" class="text-button" @click="selectUnit(directoryHint.id)">查看{{ directoryHint.name }}</button>
+            </div>
+            <div class="tabs" aria-label="院系相关记录">
+              <button v-for="kind in researchKinds" :key="kind" :class="{ active: kind === unitKind }" @click="chooseUnitKind(kind)">{{ schema[kind]?.label }}</button>
+            </div>
+            <div v-if="unitRecords.items.length" class="unit-records">
+              <button v-for="record in unitRecords.items" :key="record.id" @click="openRecord(record, unitKind)">
+                <span>{{ record.values[schema[unitKind].title] }}</span><span class="badge" :class="record.review_status">{{ statusName(record.review_status) }}</span>
+              </button>
+            </div>
+            <div v-else class="empty">该节点暂无{{ schema[unitKind]?.label }}记录。</div>
+            <div class="table-foot" v-if="unitRecords.total > pageSize"><span>共 {{ unitRecords.total }} 条</span>
+              <button class="button" :disabled="unitOffset === 0" @click="turnUnit(-1)">上一页</button><button class="button" :disabled="unitOffset + pageSize >= unitRecords.total" @click="turnUnit(1)">下一页</button></div>
+          </section>
+          <section v-else class="panel empty">选择院系后查看关联师资和科研成果。</section>
+        </div>
+      </template>
+
+      <template v-if="page === 'sources'">
+        <div class="source-grid">
+          <section class="panel source-card" v-for="source in sources" :key="source.id">
+            <div class="panel-head"><h2>{{ source.label }}</h2><span class="badge" :class="source.enabled ? 'approved' : 'ignored'">{{ source.enabled ? '定时已启用' : '定时已停用' }}</span></div>
+            <dl><div><dt>Cron</dt><dd><code>{{ source.cron }}</code></dd></div>
+              <div><dt>下次运行</dt><dd>{{ formatTime(source.next_run) }}</dd></div>
+              <div><dt>最近完成批次</dt><dd>{{ formatTime(source.last_batch_at) }}</dd></div>
+              <div><dt>最近完成同步</dt><dd>{{ formatTime(source.last_synced_at) }}</dd></div>
+              <div v-if="source.id === 'ecnu_openalex_papers' && paperWindow(source)">
+                <dt>扫描进度</dt><dd><span v-if="paperWindow(source).signature[1]">{{ paperWindow(source).signature[1] }} 年 · </span>第 {{ paperWindow(source).page }} 页 · 已读 {{ paperWindow(source).offset }} 条</dd>
+              </div>
+              <div><dt>最近任务</dt><dd>{{ sourceRunStatus(source.id) }}</dd></div></dl>
+            <div class="source-actions">
+              <button class="button primary" @click="startRun(source.id)" :disabled="isRunning(source.id)">增量采集</button>
+              <button class="button" @click="confirmFull(source)" :disabled="isRunning(source.id)">全量采集</button>
+              <button class="text-button" @click="openSource(source)">配置</button>
+              <button class="text-button" :disabled="isRunning(source.id)" @click="startRun(source.id, 'incremental', false, [], true)">重解析快照</button>
+            </div>
+          </section>
+        </div>
+        <div class="runs-layout">
+          <section class="panel">
+            <div class="panel-head"><div><h2>运行记录</h2><p>当前页面每 3 秒刷新</p></div></div>
+            <div v-if="runs.length" class="run-list">
+              <button v-for="run in runs" :key="run.id" :class="{ selected: run.id === activeRun }" @click="selectRun(run.id)">
+                <span><b>{{ sourceName(run.source_id) }}</b><small>{{ formatTime(run.started_at) }} · #{{ run.id }}</small></span>
+                <span class="badge" :class="runStatus(run)">{{ statusName(runStatus(run)) }}</span>
+              </button>
+            </div><div v-else class="empty">暂无运行记录。</div>
+          </section>
+          <section class="panel log-panel">
+            <div class="panel-head"><div><h2>任务日志 <span v-if="runInfo">#{{ runInfo.id }}</span></h2>
+              <p v-if="runInfo">{{ runInfo.mode === 'full' ? '全量' : '增量' }} · {{ statusName(runStatus(runInfo)) }}<span v-if="runInfo.elapsed_ms != null"> · {{ (runInfo.elapsed_ms / 1000).toFixed(1) }} 秒</span></p>
+            </div><button v-if="runInfo?.status === 'running'" class="button" :disabled="runInfo.cancel_requested_at" @click="cancelRun">中止任务</button></div>
+            <div v-if="runInfo" class="run-counts"><span>新增 <b>{{ runInfo.inserted }}</b></span><span>更新 <b>{{ runInfo.updated }}</b></span><span>跳过 <b>{{ runInfo.skipped }}</b></span><span>失败 <b>{{ runInfo.failed }}</b></span></div>
+            <div v-if="runLogs.length" class="logs" aria-label="任务日志明细">
+              <div v-for="line in runLogs" :key="line.id">
+                <time>{{ formatTime(line.created_at, true) }}</time><b :class="line.level">{{ logLevel(line.level) }}</b><span>{{ line.message }}</span>
+              </div>
+            </div><div v-else class="empty">{{ runInfo ? '等待任务输出。' : '选择一个任务查看详情。' }}</div>
+          </section>
+        </div>
+      </template>
+
+      <template v-if="page === 'library' && schema[kind]">
+        <div class="tabs top-tabs" aria-label="知识库">
+          <button v-for="group in libraries" :key="group.id" :class="{ active: group.id === library }" @click="chooseLibrary(group.id)">{{ group.label }}</button>
+        </div>
+        <div class="tabs subtabs" v-if="library === 'research'" aria-label="科研成果类型">
+          <button v-for="item in researchKinds" :key="item" :class="{ active: item === kind }" @click="chooseKind(item)">{{ schema[item].label }}</button>
+        </div>
+        <section class="panel">
+          <div class="filters">
+            <form class="search" @submit.prevent="offset = 0; loadRecords()">
+              <label class="sr-only" for="query">搜索知识库</label><input id="query" v-model="query" type="search" placeholder="输入关键词">
+              <button class="button">搜索</button>
+            </form>
+            <label class="inline-field">审核状态<select v-model="review" @change="offset = 0; loadRecords()"><option value="">全部</option><option v-for="item in reviews" :value="item">{{ statusName(item) }}</option></select></label>
+          </div>
+          <div v-if="records.total" class="bulk-bar" aria-label="批量审核">
+            <span>已选 {{ selectedRecords.length }} 条</span>
+            <button class="button" :disabled="!selectedRecords.length" @click="bulkReview('approved')">通过选中</button>
+            <button class="button" :disabled="!selectedRecords.length" @click="bulkReview('ignored')">忽略选中</button>
+            <details><summary>按当前筛选操作</summary>
+              <button class="text-button" @click="bulkReview('approved', true)">通过全部匹配记录</button>
+              <button class="text-button muted" @click="bulkReview('ignored', true)">忽略全部匹配记录</button>
+            </details>
+          </div>
+          <div class="table-scroll" v-if="records.items.length">
+            <table><thead><tr><th><input type="checkbox" aria-label="选中本页" :checked="selectedPage" @change="toggleSelection"></th><th>{{ schema[kind].title }}</th><th>审核状态</th><th>更新时间</th><th>来源</th><th>操作</th></tr></thead>
+              <tbody><tr v-for="item in records.items" :key="item.id">
+                <td><input type="checkbox" :aria-label="'选中 ' + item.values[schema[kind].title]" :value="item.id" v-model="selectedRecords"></td>
+                <td><button class="row-link" @click="openRecord(item)">{{ item.values[schema[kind].title] }}</button><small v-if="item.record_code">{{ item.record_code }}</small></td>
+                <td><span class="badge" :class="item.review_status">{{ statusName(item.review_status) }}</span></td>
+                <td>{{ formatTime(item.updated_at) }}</td>
+                <td><a v-if="safeLink(item.source_url)" :href="safeLink(item.source_url)" target="_blank" rel="noreferrer">原始来源</a><span v-else>—</span></td>
+                <td class="row-actions"><button class="text-button" @click="openRecord(item)">编辑</button>
+                  <button v-if="item.review_status !== 'approved'" class="text-button" @click="quickReview(item, 'approved')">通过</button>
+                  <button v-if="item.review_status !== 'ignored'" class="text-button muted" @click="quickReview(item, 'ignored')">忽略</button></td>
+              </tr></tbody>
+            </table>
+          </div>
+          <div v-else class="empty"><p>{{ query || review ? '没有匹配的记录' : '该知识库暂无记录' }}</p></div>
+          <div class="table-foot"><span>共 {{ records.total }} 条</span>
+            <button class="button" :disabled="offset === 0" @click="offset -= pageSize; loadRecords()">上一页</button>
+            <button class="button" :disabled="offset + pageSize >= records.total" @click="offset += pageSize; loadRecords()">下一页</button>
+          </div>
+        </section>
+      </template>
+
+      <template v-if="page === 'export'">
+        <section class="panel export-filter">
+          <div class="panel-head"><div><h2>导出范围</h2></div></div>
+          <label class="inline-field">Excel 与 ZIP<select v-model="exportScope"><option value="all">全库</option><option value="school">学校侧</option></select></label>
+          <label class="checkbox"><input v-model="strictExport" type="checkbox">Excel 与 ZIP 严格模式，遇到超长单元格时停止</label>
+          <label class="inline-field">审核状态<select v-model="exportReview"><option value="">导出全部</option><option v-for="item in reviews" :value="item">{{ statusName(item) }}</option></select></label>
+        </section>
+        <div class="export-grid">
+          <section class="panel">
+            <div class="panel-head"><div><h2>Excel 工作簿</h2><p>包含 4 张工作表，按原字段顺序导出。</p></div><span class="file-type">.xlsx</span></div>
+            <div class="export-body"><ul><li v-for="group in libraries.filter(item => exportScope === 'all' || item.id === 'research')">{{ group.label }}</li></ul>
+              <button class="button primary" @click="download('xlsx')">下载 Excel</button></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><div><h2>ZIP 交付包</h2><p>{{ exportScope === 'school' ? '包含科研成果工作簿、原件和院系覆盖清单。' : '包含 Excel、已归档原件和对应关系清单。' }}</p></div><span class="file-type">.zip</span></div>
+            <div class="export-body"><button class="button primary" @click="download('bundle')">下载 ZIP 交付包</button></div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><div><h2>JSON Lines</h2><p>每行一条记录，保留章节和明细层级。</p></div><span class="file-type">.jsonl</span></div>
+            <div class="export-body"><label class="form-field">知识库<select v-model="exportKind"><optgroup label="知识库"><option v-for="group in libraries" :value="group.id">{{ group.label }}</option></optgroup><optgroup label="科研成果分类"><option v-for="item in researchKinds" :value="item">{{ schema[item]?.label }}</option></optgroup></select></label>
+              <button class="button primary" @click="download('jsonl/' + exportKind)">下载 JSONL</button></div>
+          </section>
+        </div>
+      </template>
+    </div>
+  </main>
+
+  <dialog ref="dialog" @close="closeDialog" @cancel="uploading && $event.preventDefault()" :class="{ drawer: modal === 'record' }">
+    <header class="dialog-head"><h2>{{ modalTitle }}</h2><button class="close-button" aria-label="关闭" :disabled="uploading" @click="$refs.dialog.close()">×</button></header>
+    <form v-if="modal" @submit.prevent="saveModal">
+      <div class="dialog-body">
+        <p v-if="modalError" role="alert" class="alert">{{ modalError }}</p>
+        <template v-if="modal === 'record'">
+          <div class="form-grid">
+            <label v-for="field in schema[editKind].fields" :key="field.name" class="form-field" :class="{ wide: field.long }">
+              {{ field.name }}<small v-if="field.hint">{{ field.hint }}</small>
+              <select v-if="field.options" v-model="draft.values[field.name]"><option value="">未填写</option><option v-for="option in field.options">{{ option }}</option></select>
+              <textarea v-else-if="field.long" v-model="draft.values[field.name]" rows="3"></textarea>
+              <input v-else v-model="draft.values[field.name]" :required="field.name === schema[editKind].title">
+            </label>
+            <label class="form-field">审核状态<select v-model="draft.review_status"><option v-for="item in reviews" :value="item">{{ statusName(item) }}</option></select></label>
+            <fieldset class="form-field wide unit-picker" v-if="editKind === 'papers'">
+              <legend>关联院系</legend>
+              <div><label v-for="unit in units" :key="unit.id" class="checkbox"><input type="checkbox" :value="unit.id" v-model="draft.org_unit_ids">{{ unit.name }}</label></div>
+              <p class="form-hint" v-if="draft.org_unit_ids.length">已关联 {{ draft.org_unit_ids.length }} 个院系</p>
+            </fieldset>
+            <label class="form-field" v-else-if="researchKinds.includes(editKind)">关联院系<select v-model="draft.org_unit_id"><option :value="null">未关联</option><option v-for="unit in units" :value="unit.id">{{ unit.name }}</option></select></label>
+            <label class="form-field wide">来源链接<input v-model="draft.source_url" type="url" placeholder="https://"></label>
+          </div>
+          <section class="subform" v-for="section in schema[editKind].sections" :key="section.name">
+            <div class="subform-head"><h3>{{ section.name }}</h3><button type="button" class="button" @click="draft.values[section.name].push({})">新增明细</button></div>
+            <div v-if="!draft.values[section.name].length" class="form-hint">暂无明细</div>
+            <div class="detail-form" v-for="(item, index) in draft.values[section.name]" :key="index">
+              <div class="subform-head"><span>明细 {{ index + 1 }}</span><button type="button" class="text-button muted" @click="draft.values[section.name].splice(index, 1)">移除</button></div>
+              <div class="form-grid">
+                <label v-for="field in section.fields" :key="field.name" class="form-field" :class="{ wide: field.long }">
+                  {{ field.name }}<small v-if="field.hint">{{ field.hint }}</small>
+                  <select v-if="field.options" v-model="item[field.name]"><option value="">未填写</option><option v-for="option in field.options">{{ option }}</option></select>
+                  <textarea v-else-if="field.long" v-model="item[field.name]" rows="3"></textarea><input v-else v-model="item[field.name]">
+                </label>
+              </div>
+            </div>
+          </section>
+          <section class="subform" v-if="editingId">
+            <div class="subform-head"><h3>关联原件</h3></div>
+            <label class="file-drop" @dragover.prevent @drop.prevent="uploadFiles">
+              <input type="file" multiple :disabled="uploading" accept=".pdf,.doc,.docx,.xls,.xlsx,.zip,.png,.jpg,.jpeg,.gif,.webp" @change="uploadFiles">
+              <span>{{ uploading ? '正在上传' : '选择或拖入原件' }}</span>
+            </label>
+            <ul class="original-list" v-if="originals.length">
+              <li v-for="file in originals" :key="file.id">
+                <span>{{ file.filename }} <small class="badge">{{ originalStatus(file.fetch_status) }}</small></span>
+                <a v-if="['downloaded', 'manual'].includes(file.fetch_status)" :href="'/api/attachments/' + file.id">下载</a>
+                <a v-else-if="safeLink(file.source_url)" :href="safeLink(file.source_url)" target="_blank" rel="noreferrer">来源</a>
+                <small v-if="file.error_message" class="form-hint">{{ file.error_message }}</small>
+                <details v-if="file.mime_type?.startsWith('image/') && ['downloaded', 'manual'].includes(file.fetch_status)">
+                  <summary>查看归档图片</summary><img v-if="file.relative_path" :src="'/api/attachments/' + file.id + '?inline=true'" :alt="file.filename" loading="lazy">
+                </details>
+              </li>
+            </ul>
+            <details v-for="(image, idx) in legacyImages" :key="image" class="source-image">
+              <summary>查看原页图片 {{ idx + 1 }}</summary>
+              <img :src="image" :alt="'园区服务原页图片 ' + (idx + 1)" loading="lazy" referrerpolicy="no-referrer">
+            </details>
+          </section>
+        </template>
+        <div class="form-grid" v-if="modal === 'unit'">
+          <label class="form-field">院系名称<input v-model="draft.name" required></label>
+          <label class="form-field">院系类型<select v-model="draft.type"><option v-for="item in unitTypes">{{ item }}</option></select></label>
+          <label class="form-field wide">上级单位<select v-model="draft.parent_id"><option :value="null">顶层</option><option v-for="unit in units.filter(u => u.id !== editingId)" :value="unit.id">{{ unit.name }}</option></select></label>
+          <label class="form-field wide">院系官网<input type="url" v-model="draft.website_url"></label>
+          <label class="form-field wide">教师主页目录<input type="url" v-model="draft.faculty_url"></label>
+          <label class="checkbox"><input type="checkbox" v-model="draft.enabled">参与采集</label>
+          <button v-if="editingId && draft.type !== '学校'" type="button" class="text-button danger" @click="deleteUnit">删除院系</button>
+        </div>
+        <div v-if="modal === 'source'" class="form-grid">
+          <label class="checkbox wide"><input type="checkbox" v-model="draft.enabled">启用定时采集</label>
+          <label class="form-field wide">Cron（Asia/Shanghai）<input v-model="draft.cron" required placeholder="10 4 * * *"></label>
+          <label v-for="key in Object.keys(draft.options)" :key="key" class="form-field">
+            {{ optionLabels[key] || key }}
+            <select v-if="key === 'sync_strategy'" v-model="draft.options[key]"><option value="publication">发表日期</option><option value="updated">更新日期（Daily Sync）</option></select>
+            <select v-else-if="key === 'sort_order'" v-model="draft.options[key]"><option value="desc">最新在前</option><option value="asc">最早在前</option></select>
+            <input v-else-if="key === 'download_attachments'" type="checkbox" v-model="draft.options[key]">
+            <input v-else-if="key === 'from_updated_date'" type="date" v-model="draft.options[key]">
+            <input v-else type="number" min="0" v-model.number="draft.options[key]">
+          </label>
+          <p class="form-hint wide">采集数量填 0 时取消抽样上限。OpenAlex 发表年份留空时不限定年份。</p>
+        </div>
+        <div v-if="modal === 'full'">
+          <p>从当前范围的起点重新扫描。取消抽样上限后，任务耗时取决于数据量和来源限额。</p>
+          <label class="checkbox"><input type="checkbox" v-model="draft.unlimited">取消本次抽样上限</label>
+        </div>
+      </div>
+      <footer class="dialog-foot"><button v-if="modal === 'record' && editingId" type="button" class="text-button danger remove-record" :disabled="uploading || saving" @click="removeRecord">删除条目</button>
+        <button type="button" class="button" :disabled="uploading" @click="$refs.dialog.close()">取消</button><button class="button primary" :disabled="saving || uploading">{{ modal === 'full' ? '开始采集' : '保存' }}</button></footer>
+    </form>
+  </dialog>
+</div>
+<noscript>此工作台需要浏览器启用 JavaScript。</noscript>
+</body>
+</html>
