@@ -16,7 +16,8 @@ from .attachments import IMAGE_TYPES, list_attachments, original_path, upload_or
 from .collectors import COLLECTORS
 from .db import ROOT, Database, attachments, logs, org, records, runs, snapshots, sources
 from .demo import seed
-from .export import GROUPS, SCHOOL_WORKBOOK_NAME, WORKBOOK_NAME, bundle_file, excel_file, json_lines
+from .errors import NotFound
+from .export import GROUPS, SCHOOL_KINDS, SCHOOL_WORKBOOK_NAME, WORKBOOK_NAME, bundle_file, excel_file, json_lines
 from .importer import TEMPLATE_NAME, import_xlsx, template_xlsx
 from .runner import RunManager, Scheduler, cron_trigger, options_for
 from .schema import REVIEW, SPECS, catalog
@@ -76,7 +77,7 @@ def ensure_url(url, *, faculty=False, department_url=None):
 
 def ensure_kind(kind):
     if kind not in SPECS:
-        raise LookupError("知识库类别不存在")
+        raise NotFound("知识库类别不存在")
 
 
 def filter_review(value):
@@ -93,6 +94,16 @@ def school_scope(scope):
 
 def attachment(name):
     return {"Content-Disposition": "attachment; filename*=UTF-8''" + quote(name)}
+
+
+def web_origin(url):
+    try:
+        parts = urlsplit(url)
+        if parts.scheme in {"http", "https"} and parts.hostname and not (parts.username or parts.password):
+            return parts.scheme, parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        pass
+    return None
 
 
 def create_app(db_path=None):
@@ -114,10 +125,19 @@ def create_app(db_path=None):
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
+    @app.middleware("http")
+    async def protect_browser_writes(request: Request, call_next):
+        if request.url.path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"}:
+            origin = request.headers.get("origin", request.headers.get("referer"))
+            if request.headers.get("sec-fetch-site") == "cross-site" or (
+                    origin is not None and web_origin(origin) != web_origin(str(request.url))):
+                return JSONResponse(status_code=403, content={"detail": "请从工作台页面发起此操作"})
+        return await call_next(request)
+
     @app.exception_handler(ValueError)
-    @app.exception_handler(LookupError)
+    @app.exception_handler(NotFound)
     async def input_error(_: Request, exc: Exception):
-        status = 409 if isinstance(exc, Conflict) else 404 if isinstance(exc, LookupError) else 422
+        status = 409 if isinstance(exc, Conflict) else 404 if isinstance(exc, NotFound) else 422
         return JSONResponse(status_code=status, content={"detail": str(exc)})
 
     @app.get("/", include_in_schema=False)
@@ -172,8 +192,8 @@ def create_app(db_path=None):
         with db.write() as conn:
             rows = [dict(row) for row in conn.execute(select(org).where(org.c.archived.is_(False))).mappings()]
             known = {row["id"]: row for row in rows}
-            if unit_id and unit_id not in known:
-                raise LookupError("院系不存在")
+            if unit_id is not None and unit_id not in known:
+                raise NotFound("院系不存在")
             old = known.get(unit_id, {})
             candidate = old | changes
             name = (candidate.get("name") or "").strip()
@@ -193,7 +213,7 @@ def create_app(db_path=None):
             values = {key: candidate.get(key) or "" for key in ("website_url", "faculty_url")}
             values.update(name=name, type=kind, parent_id=parent, enabled=candidate.get("enabled") is not False)
             values["manual"] = not old or old["manual"] or any(old[key] != values[key] for key in values if key != "enabled")
-            if unit_id:
+            if unit_id is not None:
                 conn.execute(update(org).where(org.c.id == unit_id).values(**values))
             else:
                 unit_id = conn.execute(insert(org).values(**values, unit_key=f"manual:{uuid4().hex}")).inserted_primary_key[0]
@@ -204,7 +224,7 @@ def create_app(db_path=None):
         with app.state.db.write() as conn:
             row = conn.execute(select(org).where(org.c.id == unit_id, org.c.archived.is_(False))).mappings().one_or_none()
             if not row:
-                raise LookupError("院系不存在")
+                raise NotFound("院系不存在")
             if row["unit_key"] == "ecnu":
                 raise Conflict("学校根节点不能删除")
             if conn.scalar(select(org.c.id).where(org.c.parent_id == unit_id, org.c.archived.is_(False)).limit(1)):
@@ -215,13 +235,16 @@ def create_app(db_path=None):
     @app.get("/api/sources")
     def get_sources():
         scheduler = app.state.scheduler
-        return [app.state.db.source(key) | {"next_run": scheduler.next_run(key)} for key in COLLECTORS]
+        with app.state.db.engine.connect() as conn:
+            active = set(conn.scalars(select(runs.c.source_id).where(runs.c.status == "running")))
+        return [app.state.db.source(key) | {"next_run": scheduler.next_run(key), "running": key in active}
+                for key in COLLECTORS]
 
     @app.patch("/api/sources/{source_id}")
     def edit_source(source_id: str, form: SourceForm):
         db, scheduler = app.state.db, app.state.scheduler
         if source_id not in COLLECTORS:
-            raise LookupError("采集源不存在")
+            raise NotFound("采集源不存在")
         cron_trigger(form.cron, scheduler.timezone)
         options = options_for(source_id, form.options)
         with db.write() as conn:
@@ -234,14 +257,14 @@ def create_app(db_path=None):
     @app.post("/api/sources/{source_id}/run", status_code=202)
     def run_source(source_id: str, form: RunForm):
         if source_id not in COLLECTORS:
-            raise LookupError("采集源不存在")
+            raise NotFound("采集源不存在")
         if form.mode not in {"incremental", "full"}:
             raise ValueError("采集模式无效")
         options = {"unit_ids": form.unit_ids} if form.unit_ids else {}
         nodes = units(app.state.db)
         known = {row["id"] for row in nodes}
         if form.unit_ids and not set(form.unit_ids) <= known:
-            raise LookupError("院系不存在")
+            raise NotFound("院系不存在")
         if form.unit_ids:
             reachable = set().union(*(descendants(nodes, unit_id, respect_enabled=True) for unit_id in form.unit_ids))
             if source_id != "ecnu_faculty" or not any(row["id"] in reachable and row["faculty_url"] for row in nodes):
@@ -260,7 +283,7 @@ def create_app(db_path=None):
         with app.state.db.engine.connect() as conn:
             run = conn.execute(select(runs).where(runs.c.id == run_id)).mappings().one_or_none()
             if not run:
-                raise LookupError("任务不存在")
+                raise NotFound("任务不存在")
             items = select(logs).where(logs.c.run_id == run_id, logs.c.id > after).order_by(logs.c.id).limit(200)
             return {"run": dict(run), "logs": [dict(row) for row in conn.execute(items).mappings()]}
 
@@ -290,7 +313,7 @@ def create_app(db_path=None):
         with app.state.db.engine.connect() as conn:
             row = conn.execute(select(table).where(table.c.id == record_id)).mappings().one_or_none()
             if row is None:
-                raise LookupError("记录不存在")
+                raise NotFound("记录不存在")
             return unit_links(conn, [dict(row)])[0] if kind == "papers" else dict(row)
 
     @app.post("/api/records/{kind}/batch-review")
@@ -332,7 +355,7 @@ def create_app(db_path=None):
             file = conn.execute(select(attachments).where(attachments.c.id == attachment_id)).mappings().one_or_none()
         path = original_path(db, file["relative_path"]) if file else None
         if path is None or file["fetch_status"] not in {"manual", "downloaded"}:
-            raise LookupError("本地原件不存在")
+            raise NotFound("本地原件不存在")
         preview = inline and file["mime_type"] in IMAGE_TYPES
         return FileResponse(path, filename=file["filename"], media_type=file["mime_type"] if preview else "application/octet-stream",
                             content_disposition_type="inline" if preview else "attachment",
@@ -346,11 +369,12 @@ def create_app(db_path=None):
 
     @app.post("/api/import/xlsx")
     def import_workbook(file: UploadFile = File(...), dry_run: bool = Form(True),
-                        review_status: str = Form("pending")):
+                        review_status: str = Form("pending"), overwrite_review: bool = Form(False)):
         try:
             if not (file.filename or "").lower().endswith(".xlsx"):
                 raise ValueError("请选择 .xlsx 工作簿")
-            return import_xlsx(app.state.db, file.file, dry_run=dry_run, review_status=review_status)
+            return import_xlsx(app.state.db, file.file, dry_run=dry_run, review_status=review_status,
+                               overwrite_review=overwrite_review)
         finally:
             file.file.close()
 
@@ -381,11 +405,12 @@ def create_app(db_path=None):
 
     @app.get("/api/export/jsonl/{kind}")
     def export_jsonl(kind: str, review: str | None = None):
-        choices = {"research": ("faculty", "patents", "papers", "projects")}
-        if kind not in choices:
+        choices = {"research": ("科研成果库", tuple(SCHOOL_KINDS)), "all": ("全库", tuple(SPECS))}
+        if kind in choices:
+            name, targets = choices[kind]
+        else:
             ensure_kind(kind)
-        targets = choices.get(kind, (kind,))
-        name = "科研成果库" if kind == "research" else SPECS[kind].label
+            name, targets = SPECS[kind].label, (kind,)
         return StreamingResponse(json_lines(app.state.db, targets, filter_review(review)), media_type="application/x-ndjson",
                                  headers=attachment(f"{name}.jsonl"))
 

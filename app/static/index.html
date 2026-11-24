@@ -240,11 +240,13 @@
             <label class="form-field">Excel 工作簿<input type="file" accept=".xlsx" :disabled="importBusy"
               @change="chooseImportFile($event.target.files[0]); $event.target.value = ''"></label>
             <p v-if="importFile">{{ importFile.name }}</p>
-            <label class="inline-field">导入后审核状态
+            <label class="inline-field">新记录审核状态
               <select v-model="importReview" :disabled="importBusy" @change="importResult = null">
                 <option value="pending">待审核</option><option value="approved">已通过</option>
               </select>
             </label>
+            <label class="checkbox"><input type="checkbox" v-model="overwriteReview" :disabled="importBusy"
+              @change="importResult = null">同时更改已有记录的审核状态</label>
             <div class="actions">
               <button class="button" :disabled="!importFile || importBusy" @click="submitImport(true)">预检文件</button>
               <button class="button primary" :disabled="importBusy || !importResult?.dry_run || !!importResult.errors.length"
@@ -286,7 +288,7 @@
           </section>
           <section class="panel">
             <div class="panel-head"><div><h2>JSON Lines</h2><p>每行一条记录，保留章节和明细层级。</p></div><span class="file-type">.jsonl</span></div>
-            <div class="export-body"><label class="form-field">知识库<select v-model="exportKind"><optgroup label="知识库"><option v-for="group in libraries" :value="group.id">{{ group.label }}</option></optgroup><optgroup label="科研成果分类"><option v-for="item in researchKinds" :value="item">{{ schema[item]?.label }}</option></optgroup></select></label>
+            <div class="export-body"><label class="form-field">知识库<select v-model="exportKind"><option value="all">全库</option><optgroup label="知识库"><option v-for="group in libraries" :value="group.id">{{ group.label }}</option></optgroup><optgroup label="科研成果分类"><option v-for="item in researchKinds" :value="item">{{ schema[item]?.label }}</option></optgroup></select></label>
               <button class="button primary" @click="download('jsonl/' + exportKind)">下载 JSONL</button></div>
           </section>
         </div>
@@ -360,7 +362,7 @@
           <label class="form-field wide">院系官网<input type="url" v-model="draft.website_url"></label>
           <label class="form-field wide">教师主页目录<input type="url" v-model="draft.faculty_url"></label>
           <label class="checkbox"><input type="checkbox" v-model="draft.enabled">参与采集</label>
-          <button v-if="editingId && draft.type !== '学校'" type="button" class="text-button danger" @click="deleteUnit">删除院系</button>
+          <button v-if="editingId && draft.type !== '学校'" type="button" class="text-button danger" :disabled="saving" @click="deleteUnit">删除院系</button>
         </div>
         <div v-if="modal === 'source'" class="form-grid">
           <label class="checkbox wide"><input type="checkbox" v-model="draft.enabled">启用定时采集</label>

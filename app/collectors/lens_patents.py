@@ -22,7 +22,9 @@ KINDS = {"1": "发明专利", "2": "实用新型", "3": "外观设计"}
 PROJECTION = ["lens_id", "jurisdiction", "kind", "doc_number", "date_published", "publication_type",
               "biblio.invention_title", "biblio.application_number", "biblio.application_reference",
               "biblio.publication_reference", "biblio.parties.inventors", "biblio.classifications_cpc",
-              "biblio.classifications_ipcr", "abstract", "legal_status.grant_date", "legal_status.patent_status"]
+              "biblio.classifications_ipcr", "biblio.classifications_ipc", "abstract", "legal_status.grant_date",
+              "legal_status.patent_status"]
+OFFSET_LIMIT = 10000
 
 
 def token():
@@ -81,7 +83,7 @@ class LensPatentCollector(BaseCollector):
             return value
 
         page = scrub({"data": page["data"], "total": page.get("total")})
-        if type(page["total"]) is not int or page["total"] <= 10000:
+        if type(page["total"]) is not int or page["total"] <= OFFSET_LIMIT:
             self.snapshot(url, digest(payload), json.dumps(page, ensure_ascii=False).encode(), "application/json", 200)
         return page
 
@@ -133,6 +135,9 @@ class LensPatentCollector(BaseCollector):
             clean(item.get("symbol")) for key in ("classifications_cpc", "classifications_ipcr", "classifications_ipc")
             for item in (biblio.get(key) or {}).get("classifications", []) if item.get("symbol")
         )
+        ipc = biblio.get("classifications_ipc") or {}
+        if symbol := clean(ipc.get("main_classification") or ipc.get("main_symbol")):
+            keywords[symbol] = None
         evidence = patent.get("date_published") or published.get("date") or ""
         granted = legal.get("grant_date") or (evidence if document_type in GRANTED else "")
         year = re.match(r"\d{4}", granted)
@@ -176,10 +181,10 @@ class LensPatentCollector(BaseCollector):
             if lower > upper:
                 windows.pop(0)
                 continue
-            size = min(100, limit - count)
-            page = self.request(self.query(lower, upper, order, offset, size), credential)
-            total = page.get("total")
-            if type(total) is int and total > 10000:
+            size = min(100, limit - count, OFFSET_LIMIT - offset)
+            page = self.request(self.query(lower, upper, order, offset, size), credential) if size > 0 else None
+            total = page.get("total") if page is not None else None
+            if page is None or type(total) is int and total > OFFSET_LIMIT:
                 begin, finish = date.fromisoformat(lower), date.fromisoformat(upper)
                 if begin == finish:
                     raise ValueError("Lens 同一天的结果超过分页上限，请缩小申请人或专利局范围")

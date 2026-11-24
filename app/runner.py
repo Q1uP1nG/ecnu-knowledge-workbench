@@ -16,6 +16,7 @@ from .collectors.base import public_url
 from .attachments import register_original
 from .db import logs, now, runs, sources
 from .enrich import BaseEnricher
+from .errors import Cancelled, NotFound
 from .schema import SPECS
 from .store import Conflict, upsert_entry
 
@@ -32,10 +33,6 @@ OPTIONS = {
     "ecnu_lens_patents": {"max_patents": (0, 200000), "publication_year": (1900, 2200),
                           "from_date": None, "sort_order": ("asc", "desc")},
 }
-
-class Cancelled(InterruptedError):
-    pass
-
 
 def options_for(source_id, raw, *, scoped=False):
     allowed = OPTIONS[source_id]
@@ -122,14 +119,23 @@ class RunContext:
         self.heartbeat()
         delay = self.db.config["http"]["interval_seconds"] - (time.monotonic() - self.last_asset_at)
         if delay > 0:
-            time.sleep(delay)
+            self.wait(delay)
         self.last_asset_at = time.monotonic()
 
-    def checkpoint(self, strategy, value):
+    def wait(self, seconds):
+        deadline = time.monotonic() + seconds
+        while (remaining := deadline - time.monotonic()) > 0:
+            if self.stop.wait(min(remaining, 0.5)):
+                raise Cancelled("工作台正在关闭")
+            if not self.dry_run:
+                with self.db.engine.connect() as conn:
+                    self.active(conn)
+
+    def checkpoint(self, strategy, value, **other):
         if not self.dry_run:
             with self.db.write() as conn:
                 self.active(conn)
-                self.prior = self.prior | {strategy: value}
+                self.prior = self.prior | {strategy: value} | other
                 conn.execute(update(sources).where(sources.c.id == self.source_id).values(cursor_json=self.prior))
 
     def count(self, key):
@@ -177,20 +183,28 @@ class RunManager:
         self.stop = Event()
         self.enricher = enricher
 
+    def _reap_stale_runs(self, conn, stamp, source_id=None):
+        stale = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="microseconds")
+        query = select(runs.c.id, runs.c.cancel_requested_at).where(
+            runs.c.status == "running", runs.c.heartbeat_at < stale)
+        if source_id is not None:
+            query = query.where(runs.c.source_id == source_id)
+        for run_id, request in conn.execute(query).all():
+            conn.execute(update(runs).where(runs.c.id == run_id).values(
+                status="cancelled" if request else "failed", finished_at=stamp,
+                failed=runs.c.failed if request else runs.c.failed + 1))
+            conn.execute(insert(logs).values(run_id=run_id, level="error", created_at=stamp,
+                                             message="任务心跳超时，后续运行会从可恢复进度继续"))
+
+    def reap_stale_runs(self):
+        with self.db.write() as conn:
+            self._reap_stale_runs(conn, now())
+
     def claim(self, source_id, mode, trigger):
         self.db.source(source_id)
-        stamp = now()
-        stale = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="microseconds")
         with self.db.write() as conn:
-            abandoned = list(conn.scalars(select(runs.c.id).where(runs.c.source_id == source_id,
-                runs.c.status == "running", runs.c.heartbeat_at < stale)))
-            for run_id in abandoned:
-                request = conn.scalar(select(runs.c.cancel_requested_at).where(runs.c.id == run_id))
-                conn.execute(update(runs).where(runs.c.id == run_id).values(
-                    status="cancelled" if request else "failed", finished_at=stamp,
-                    failed=runs.c.failed if request else runs.c.failed + 1))
-                conn.execute(insert(logs).values(run_id=run_id, level="error", created_at=stamp,
-                                                message="任务心跳超时，后续运行会从可恢复进度继续"))
+            stamp = now()
+            self._reap_stale_runs(conn, stamp, source_id)
             if conn.scalar(select(runs.c.id).where(runs.c.source_id == source_id, runs.c.status == "running")):
                 raise Conflict("此来源正在采集")
             return conn.execute(insert(runs).values(source_id=source_id, mode=mode, trigger=trigger,
@@ -200,7 +214,7 @@ class RunManager:
         with self.db.write() as conn:
             row = conn.execute(select(runs).where(runs.c.id == run_id)).mappings().one_or_none()
             if not row:
-                raise LookupError("任务不存在")
+                raise NotFound("任务不存在")
             if row["status"] not in {"running", "cancelled"}:
                 raise Conflict("只可中止运行中的任务")
             if row["status"] == "running" and not row["cancel_requested_at"]:
@@ -293,6 +307,8 @@ class Scheduler:
         self.pool = ThreadPoolExecutor(max_workers=len(COLLECTORS), thread_name_prefix="collector")
 
     def start(self):
+        self.manager.reap_stale_runs()
+        self.cron.add_job(self.manager.reap_stale_runs, "interval", seconds=30, coalesce=True)
         self.cron.start()
         for key in COLLECTORS:
             self.configure(self.manager.db.source(key))

@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import httpx
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import select, update
@@ -17,7 +18,7 @@ from sqlalchemy import select, update
 from app.collectors.faculty import FacultyCollector
 from app.collectors.lens_patents import SOURCE_ID, LensPatentCollector
 from app.collectors.transfer import TransferCollector
-from app.db import ROOT, Database, digest, logs, now, records, snapshots
+from app.db import ROOT, Database, digest, logs, now, records, snapshots, sources
 from app.export import GROUPS, column_names, excel_file
 from app.importer import import_xlsx
 from app.main import create_app
@@ -174,6 +175,58 @@ class LensAndImport(unittest.TestCase):
         self.assertEqual(second_record["values"]["法律状态"], "无效")
         self.assertEqual(first_record["org_unit_id"], self.unit)
 
+    def test_lens_resume_stays_inside_offset_limit(self):
+        config = self.db.config["sources"][SOURCE_ID]
+        key = "publication:" + digest([2025, None, "desc", config["applicants"], config["jurisdictions"]])
+        cursor = {key: {"windows": [["2025-01-01", "2025-12-31", 9950]], "ceiling": "2025-12-31"}}
+        with self.db.write() as conn:
+            conn.execute(update(sources).where(sources.c.id == SOURCE_ID).values(cursor_json=cursor))
+        patent = PATENT_RECORD | {"biblio": PATENT_RECORD["biblio"] | {
+            "classifications_ipc": {"main_classification": "A01B1/00"}}}
+        manager = RunManager(self.db)
+        with patch.dict("os.environ", {"LENS_API_TOKEN": TOKEN}), \
+             patch.object(LensPatentCollector, "fetch", return_value=json.dumps({"data": [patent], "total": 10000}).encode()) as fetch:
+            result = manager.execute(SOURCE_ID, overrides={"publication_year": 2025, "max_patents": 100})
+        self.assertEqual(result["status"], "succeeded")
+        request = fetch.call_args.kwargs["json_body"]
+        self.assertEqual((request["from"], request["size"]), (9950, 50))
+        self.assertIn("biblio.classifications_ipc", request["include"])
+        self.assertIn("A01B1/00", self.all("patents")[0]["values"]["技术领域关键词"])
+
+    def test_lens_splits_full_windows_and_recovers_legacy_offset(self):
+        config = self.db.config["sources"][SOURCE_ID]
+        key = "publication:" + digest([2025, None, "desc", config["applicants"], config["jurisdictions"]])
+        manager = RunManager(self.db)
+        for offset in (0, 10000):
+            cursor = {key: {"windows": [["2025-01-01", "2025-12-31", offset]], "ceiling": "2025-12-31"}}
+            with self.db.write() as conn:
+                conn.execute(update(sources).where(sources.c.id == SOURCE_ID).values(cursor_json=cursor))
+            responses = [{"data": [], "total": 0}] * 2
+            if offset == 0:
+                responses.insert(0, {"data": [], "total": 10001})
+            with self.subTest(offset=offset), patch.dict("os.environ", {"LENS_API_TOKEN": TOKEN}), \
+                 patch.object(LensPatentCollector, "fetch", side_effect=[json.dumps(item).encode() for item in responses]) as fetch:
+                result = manager.execute(SOURCE_ID, overrides={"publication_year": 2025})
+                self.assertEqual(result["status"], "succeeded")
+                pages = [item.kwargs["json_body"] for item in fetch.call_args_list]
+                self.assertTrue(all(item["from"] == 0 for item in pages))
+                self.assertEqual(len(pages), len(responses))
+                self.assertNotEqual(pages[-2]["query"], pages[-1]["query"])
+
+    def test_lens_handles_http_permission_errors_and_invalid_json(self):
+        manager = RunManager(self.db)
+        client = httpx.Client
+        for status, expected in ((401, "权限"), (403, "权限"), (200, "无效的 JSON")):
+            def serve(request):
+                self.assertEqual(request.headers["Authorization"], "Bearer " + TOKEN)
+                return httpx.Response(status, content=TOKEN.encode())
+            with self.subTest(status=status), patch.dict("os.environ", {"LENS_API_TOKEN": TOKEN}), \
+                 patch("app.collectors.base.httpx.Client", side_effect=lambda **kw: client(transport=httpx.MockTransport(serve), **kw)):
+                result = manager.execute(SOURCE_ID, dry_run=True)
+            self.assertEqual(result["status"], "failed")
+            self.assertIn(expected, result["error"])
+            self.assertNotIn(TOKEN, json.dumps(result))
+
     def test_lens_links_publication_number_to_application_without_merging_unrelated_number(self):
         context = SimpleNamespace(db=self.db, config=self.db.config["sources"][TRANSFER], options={})
         collector = TransferCollector(context)
@@ -284,6 +337,35 @@ class LensAndImport(unittest.TestCase):
         self.assertEqual(self.all("companies")[0]["values"]["核心技术痛点"], "设备停机监测")
         again = self.file_test(data, dry_run=False)
         self.assertEqual(sum(t["will_skip"] for t in again["tables"].values()), 6, again)
+
+    def test_paper_round_trip_preserves_review_and_links_and_locks_only_changes(self):
+        sync_units(self.db, [Unit("other", "另一学院", "学院"), Unit("new", "新增学院", "学院")])
+        other, new = (next(row["id"] for row in units(self.db) if row["name"] == name) for name in ("另一学院", "新增学院"))
+        with self.db.write() as conn:
+            _, paper = upsert_entry(conn, "ecnu_openalex_papers", Entry("papers", "paper",
+                {"论文标题": "已审核论文", "DOI/链接": "https://doi.org/10.1000/roundtrip", "技术摘要": "原摘要"}, "",
+                org_ids=(self.unit, other)), return_id=True)
+            conn.execute(update(records["papers"]).values(review_status="approved"))
+        original = self.all("papers")[0]
+        result = self.file_test(BytesIO(excel_file(self.db, None)), dry_run=False)
+        self.assertEqual(result["tables"]["papers"]["will_skip"], 1, result)
+        self.assertEqual(self.all("papers")[0], original)
+        headers = ("成果编号", "论文标题", "技术摘要", "院系")
+        code = original["record_code"]
+        data = one_sheet(RESEARCH, [headers, (code, "已审核论文", "新摘要", "测试学院"),
+                                    (code, "已审核论文", "新摘要", "新增学院")])
+        self.assertEqual(self.file_test(data)["tables"]["papers"]["will_update"], 1)
+        self.assertEqual(self.all("papers")[0], original)
+        self.assertTrue(self.file_test(data, dry_run=False)["committed"])
+        with TestClient(create_app(self.path)) as client:
+            row = client.get(f"/api/records/papers/{paper}").json()
+            self.assertEqual(row["review_status"], "approved")
+            self.assertEqual(row["locked_fields"], ["@org_unit_id", "技术摘要"])
+            self.assertEqual(set(row["org_unit_ids"]), {self.unit, other, new})
+            response = client.post("/api/import/xlsx", files={"file": ("test.xlsx", data.getvalue())},
+                                   data={"dry_run": "false", "review_status": "pending", "overwrite_review": "true"})
+            self.assertTrue(response.json()["committed"])
+            self.assertEqual(client.get(f"/api/records/papers/{paper}").json()["review_status"], "pending")
 
     def test_cli_import_research_subset(self):
         data = one_sheet(RESEARCH, [("学院项目",), ("项目名称", "项目类型", "院系"),

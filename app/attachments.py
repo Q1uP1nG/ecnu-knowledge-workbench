@@ -1,7 +1,8 @@
 import hashlib
+import ipaddress
 import os
 import re
-import time
+import socket
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert
 
 from .db import attachments, now, records
+from .errors import Cancelled, NotFound
 
 TYPES = {
     ".pdf": "application/pdf", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -21,6 +23,9 @@ TYPES = {
     ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
 }
 IMAGE_TYPES = frozenset(value for value in TYPES.values() if value.startswith("image/"))
+PRIVATE_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
+))
 
 
 @dataclass(frozen=True)
@@ -45,7 +50,7 @@ def clean_filename(value):
 
 def record_exists(conn, kind, record_id):
     if conn.scalar(select(records[kind].c.id).where(records[kind].c.id == record_id)) is None:
-        raise LookupError("记录不存在")
+        raise NotFound("记录不存在")
 
 
 def original_path(db, relative):
@@ -130,6 +135,8 @@ def register_original(db, kind, record_id, original, context):
         else:
             meta, filename = fetch_original(db, original, filename, context)
         updated = meta | {"filename": filename, "fetch_status": "downloaded", "error_message": None}
+    except Cancelled:
+        raise
     except LinkOnly as exc:
         updated = {"fetch_status": "link_only", "error_message": str(exc)}
     except (ValueError, OSError, httpx.HTTPError) as exc:
@@ -160,6 +167,7 @@ def fetch_original(db, original, filename, context):
     if hosts is None:
         hosts = config["park_hosts"] if context.source_id == "ecnu_science_park" else config["paper_hosts"]
     with httpx.Client(timeout=http["timeout_seconds"], trust_env=False,
+                       limits=httpx.Limits(max_keepalive_connections=0),
                       headers={"User-Agent": http["user_agent"], "Accept-Encoding": "identity"}) as client:
         for attempt in range(3):
             try:
@@ -169,19 +177,47 @@ def fetch_original(db, original, filename, context):
                 if attempt == 2 or retry_after > 60:
                     raise
                 context.log("warning", f"原件下载暂时失败，准备第 {attempt + 1} 次重试", original.url)
-                time.sleep(max(retry_after, http["backoff_seconds"] * 2 ** attempt))
+                context.wait(max(retry_after, http["backoff_seconds"] * 2 ** attempt))
+
+
+def open_original_response(client, url, host, private_networks):
+    try:
+        addresses = dict.fromkeys(ipaddress.ip_address(info[4][0])
+                                  for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM))
+    except socket.gaierror as exc:
+        raise httpx.ConnectError("无法解析附件下载域名") from exc
+    error = httpx.ConnectError("附件下载域名未返回可用地址")
+    for address in addresses:
+        ip = getattr(address, "ipv4_mapped", None) or address
+        allowed_private = any(ip in network for network in private_networks)
+        if not allowed_private and (not ip.is_global or ip.is_multicast or getattr(ip, "is_site_local", False)):
+            raise LinkOnly("附件下载地址解析到非公网 IP")
+    for address in addresses:
+        # Connect to the checked address while retaining the original hostname for TLS and HTTP.
+        request = client.build_request("GET", httpx.URL(url).copy_with(host=str(address)),
+                                       headers={"Host": host}, extensions={"sni_hostname": host})
+        try:
+            return client.send(request, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            error = exc
+    raise error
 
 
 def fetch_original_attempt(client, db, original, filename, context, hosts):
     url = original.url
+    campus_hosts = db.config["attachments"].get("private_host_networks") or {}
     for _ in range(5):
         target = urlsplit(url)
         host = target.hostname or ""
         if target.scheme != "https" or target.username or target.password or target.port not in (None, 443) or not any(
                 host == item or host.endswith("." + item) for item in hosts):
             raise LinkOnly("下载地址不在该来源的自动归档域名范围内")
+        networks = tuple(ipaddress.ip_network(cidr) for cidr in (campus_hosts.get(host) or ()))
+        if any(not any(network.version == block.version and network.subnet_of(block) for block in PRIVATE_NETWORKS)
+               for network in networks):
+            raise ValueError("附件私网例外只能使用 RFC 1918 或 IPv6 ULA 网段")
         context.asset_wait()
-        with client.stream("GET", url) as response:
+        with closing(open_original_response(client, url, host, networks)) as response:
             if response.is_redirect and response.headers.get("location"):
                 url = urljoin(url, response.headers["location"])
                 continue
@@ -228,7 +264,7 @@ def upload_original(db, kind, record_id, upload, expected_updated_at=None):
         row = conn.execute(select(table.c["values"], table.c.locked_fields, table.c.updated_at)
                            .where(table.c.id == record_id)).one_or_none()
         if row is None:
-            raise LookupError("记录不存在")
+            raise NotFound("记录不存在")
         if expected_updated_at and row.updated_at != expected_updated_at:
             from .store import Conflict
             raise Conflict("记录已有更新，请重新打开后上传")

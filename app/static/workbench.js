@@ -36,18 +36,25 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const blankList = () => ({ total: 0, items: [] });
 const compare = (left, right) => JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
 
+async function jsonResponse(response, fallback = "请求失败") {
+  if (response.status === 204) return null;
+  const result = await response.json().catch(() => {
+    throw new Error(`${response.ok ? "服务器返回了无效响应" : fallback} · HTTP ${response.status}`);
+  });
+  if (!response.ok) {
+    const detail = result?.detail;
+    throw new Error(Array.isArray(detail) ? detail.map(item => item.msg).join("；") : detail || `${fallback} · HTTP ${response.status}`);
+  }
+  return result;
+}
+
 async function api(endpoint, method = "GET", body) {
   const init = { method };
   if (body !== undefined) {
     init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
   }
-  const response = await fetch("/api/" + endpoint, init);
-  if (!response.ok) {
-    const err = (await response.json().catch(() => ({}))).detail;
-    throw new Error(Array.isArray(err) ? err.map(item => item.msg).join("；") : err || ("请求失败 · " + response.status));
-  }
-  return response.status === 204 ? null : response.json();
+  return jsonResponse(await fetch("/api/" + endpoint, init));
 }
 
 Vue.createApp({
@@ -58,11 +65,11 @@ Vue.createApp({
       researchKinds: ["faculty", "patents", "papers", "projects"],
       unitTypes: ["学部", "书院", "学院", "系", "研究机构", "直属单位", "学校"],
       unitKind: "faculty", unitOffset: 0, unitRecords: blankList(), pageSize: 20,
-      sources: [], runs: [], activeRun: null, runInfo: null, runLogs: [], polling: false,
+      sources: [], runs: [], activeRun: null, runInfo: null, runLogs: [], polling: false, startingSources: [],
       library: "services", kind: "services", query: "", review: "", reviews: ["pending", "approved", "ignored"],
       offset: 0, records: blankList(), exportKind: "services", exportReview: "", exportScope: "all",
       selectedRecords: [], appliedFilter: {}, strictExport: false,
-      importFile: null, importReview: "pending", importResult: null, importBusy: false, importError: "",
+      importFile: null, importReview: "pending", overwriteReview: false, importResult: null, importBusy: false, importError: "",
       originals: [], uploading: false,
       metrics: [{ id: "inserted", label: "新增" }, { id: "updated", label: "更新" }, { id: "failed", label: "失败" }],
       selectedMetric: "inserted", selectedDay: "", modal: "", modalTitle: "", modalError: "", editKind: "",
@@ -171,7 +178,10 @@ Vue.createApp({
     runStatus(run) { return run?.status === "running" && run.cancel_requested_at ? "cancelling" : run?.status; },
     originalStatus(status) { return { downloaded: "已归档", manual: "人工上传", link_only: "仅链接", failed: "获取失败" }[status]; },
     logLevel(key) { return { info: "信息", warning: "提示", error: "错误" }[key] || key; },
-    formatTime(value, compact = false) { return value ? (compact ? clock : time).format(new Date(value)) : "—"; },
+    formatTime(value, compact = false) {
+      const stamp = value ? new Date(value) : null;
+      return stamp && Number.isFinite(stamp.getTime()) ? (compact ? clock : time).format(stamp) : "—";
+    },
     safeLink(value) {
       try {
         const url = new URL(value);
@@ -260,8 +270,11 @@ Vue.createApp({
       await this.selectRun(id);
       await this.navigate("sources");
     },
-    isRunning(key) { return this.runs.some(run => run.source_id === key && run.status === "running"); },
-    sourceRunStatus(key) { return this.statusName(this.runStatus(this.runs.find(run => run.source_id === key))) || "—"; },
+    isRunning(key) { return this.startingSources.includes(key) || this.sources.some(source => source.id === key && source.running); },
+    sourceRunStatus(key) {
+      const run = this.runs.find(item => item.source_id === key);
+      return this.statusName(this.isRunning(key) && run?.status !== "running" ? "running" : this.runStatus(run)) || "—";
+    },
     async cancelRun() {
       if (!this.runInfo || this.runInfo.cancel_requested_at) return;
       try {
@@ -271,6 +284,8 @@ Vue.createApp({
       } catch (err) { this.error = err.message; }
     },
     async startRun(id, mode = "incremental", unlimited = false, unitIDs = [], replay = false) {
+      if (this.isRunning(id)) return;
+      this.startingSources.push(id);
       try {
         const result = await api("sources/" + id + "/run", "POST", { mode, unlimited, unit_ids: unitIDs, replay_cache: replay });
         if (this.modal) this.$refs.dialog.close();
@@ -280,6 +295,7 @@ Vue.createApp({
         if (this.modal) this.modalError = err.message;
         else this.error = err.message;
       }
+      finally { this.startingSources = this.startingSources.filter(key => key !== id); }
     },
     async openLibrary(group) {
       this.library = group;
@@ -396,8 +412,7 @@ Vue.createApp({
           form.append("file", file);
           form.append("expected_updated_at", this.original.updated_at);
           const response = await fetch(`/api/records/${this.editKind}/${this.editingId}/attachments`, { method: "POST", body: form });
-          const result = await response.json();
-          if (!response.ok) throw new Error(result.detail || "上传失败");
+          const result = await jsonResponse(response, "上传失败");
           if (result.duplicate) duplicates += 1;
           this.originals = result.attachment_list;
           for (const field of ["原始文件名", "政策附件"]) {
@@ -406,6 +421,12 @@ Vue.createApp({
             }
           }
           this.original = result.record;
+          for (const [kind, list] of [[this.kind, this.records], [this.unitKind, this.unitRecords]]) {
+            if (kind === this.editKind) {
+              const index = list.items.findIndex(item => item.id === result.record.id);
+              if (index !== -1) list.items[index] = { ...list.items[index], ...result.record };
+            }
+          }
         }
         this.showNotice(duplicates
           ? `保存 ${files.length - duplicates} 份原件，${duplicates} 份内容相同，已跳过。`
@@ -417,7 +438,8 @@ Vue.createApp({
       }
     },
     async removeRecord() {
-      if (!confirm("删除这条记录及其原件引用。后续采集也会跳过这条记录。继续？")) return;
+      if (this.saving || this.uploading || !confirm("删除这条记录及其原件引用。后续采集也会跳过这条记录。继续？")) return;
+      this.saving = true;
       try {
         await api(`records/${this.editKind}/${this.editingId}?` + new URLSearchParams({
           expected_updated_at: this.original.updated_at,
@@ -427,8 +449,10 @@ Vue.createApp({
         if (this.page === "library") { this.offset = 0; await this.loadRecords(); }
         this.showNotice("记录已删除");
       } catch (err) { this.modalError = err.message; }
+      finally { this.saving = false; }
     },
     async saveModal() {
+      if (this.saving || this.uploading) return;
       this.modalError = ""; this.saving = true;
       try {
         if (this.modal === "full") {
@@ -449,13 +473,15 @@ Vue.createApp({
       finally { this.saving = false; }
     },
     async deleteUnit() {
-      if (!confirm("将从院系目录移除此节点。继续？")) return;
+      if (this.saving || !confirm("将从院系目录移除此节点。继续？")) return;
+      this.saving = true;
       try {
         await api("units/" + this.editingId, "DELETE");
         this.$refs.dialog.close();
         await this.loadUnits();
         this.showNotice("已移除院系节点");
       } catch (err) { this.modalError = err.message; }
+      finally { this.saving = false; }
     },
     chooseImportFile(file) {
       if (this.importBusy) return;
@@ -473,10 +499,9 @@ Vue.createApp({
         body.append("file", this.importFile);
         body.append("dry_run", String(dryRun));
         body.append("review_status", this.importReview);
+        body.append("overwrite_review", String(this.overwriteReview));
         const response = await fetch("/api/import/xlsx", { method: "POST", body });
-        const result = await response.json();
-        if (!response.ok) throw new Error(Array.isArray(result.detail)
-          ? result.detail.map(item => item.msg).join("；") : result.detail || "导入请求失败");
+        const result = await jsonResponse(response, "导入请求失败");
         this.importResult = result;
         if (result.committed) {
           this.showNotice("Excel 导入成功");

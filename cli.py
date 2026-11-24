@@ -49,6 +49,7 @@ def parser():
     load.add_argument("--file", required=True, metavar="PATH.xlsx")
     load.add_argument("--dry-run", action="store_true", help="只预检，回滚所有数据库改动")
     load.add_argument("--review-status", choices=("pending", "approved"), default="pending")
+    load.add_argument("--overwrite-review", action="store_true", help="同时更改已有记录的审核状态")
     return app
 
 
@@ -70,7 +71,8 @@ def run_all(manager, scope, overrides):
     totals = {key: sum(item[key] for item in results) for key in STATUS_KEYS}
     statuses = {item["status"] for item in results}
     status = ("cancelled" if "cancelled" in statuses else
-              "failed" if totals["failed"] or statuses & {"failed", "conflict"} else "succeeded")
+              "failed" if totals["failed"] or statuses & {"failed", "conflict"} else
+              "partial" if "partial" in statuses else "succeeded")
     return {"scope": scope, "status": status, **totals, "sources": results}
 
 
@@ -94,7 +96,8 @@ def main():
             if not args.file.lower().endswith(".xlsx"):
                 raise ValueError("请选择 .xlsx 工作簿")
             with open(args.file, "rb") as stream:
-                return import_xlsx(db, stream, dry_run=args.dry_run, review_status=args.review_status)
+                return import_xlsx(db, stream, dry_run=args.dry_run, review_status=args.review_status,
+                                   overwrite_review=args.overwrite_review)
         options = {k: v for k, v in vars(args).items()
                    if v is not None and k not in {"db", "command", "source", "mode", "dry_run", "unlimited"}}
         return RunManager(db).execute(args.source, args.mode, overrides=options,

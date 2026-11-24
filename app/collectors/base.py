@@ -82,7 +82,7 @@ class BaseCollector(ABC):
             self.ctx.heartbeat()
             delay = self.http["interval_seconds"] - (time.monotonic() - self.host_times.get(host, 0))
             if delay > 0:
-                time.sleep(delay)
+                self.ctx.wait(delay)
             self.host_times[host] = time.monotonic()
             retry_after = 0
             try:
@@ -97,9 +97,14 @@ class BaseCollector(ABC):
                         chunks.append(chunk)
                     body = b"".join(chunks)
                     if cache_response:
-                        self.snapshot(self.response_url, digest([method, public_url(response.request.url), data, json_body]
-                                      if json_body is not None else [method, public_url(response.request.url), data]),
-                                      body, response.headers.get("content-type", ""), response.status_code)
+                        first = response.history[0] if response.history else response
+                        request_url = public_url(first.request.url)
+                        request = [method, request_url, data]
+                        if json_body is not None:
+                            request.append(json_body)
+                        self.snapshot(self.response_url, digest(request), body,
+                                      response.headers.get("content-type", ""), response.status_code,
+                                      request_url=request_url)
                     if response.is_success:
                         return body
                     status = response.status_code
@@ -125,10 +130,10 @@ class BaseCollector(ABC):
             if attempt == retries:
                 raise error
             self.ctx.log("warning", f"{error}，准备第 {attempt + 1} 次重试", public_url(url))
-            time.sleep(max(retry_after, self.http["backoff_seconds"] * 2 ** attempt + random.random() * 0.2))
+            self.ctx.wait(max(retry_after, self.http["backoff_seconds"] * 2 ** attempt + random.random() * 0.2))
         raise AssertionError("unreachable")
 
-    def snapshot(self, url, request_key, body, content_type, status):
+    def snapshot(self, url, request_key, body, content_type, status, *, request_url=None):
         if self.ctx.dry_run:
             return
         stamp = now()
@@ -136,24 +141,27 @@ class BaseCollector(ABC):
         with self.ctx.db.write() as conn:
             self.ctx.active(conn)
             stmt = insert(snapshots).values(source_id=self.ctx.source_id, url=url, request_key=request_key,
+                request_url=request_url or url,
                 content_hash=fingerprint, content_type=content_type, http_status=status,
                 fetched_at=stamp, last_seen_at=stamp, content_gzip=gzip.compress(body))
             conn.execute(stmt.on_conflict_do_update(
-                index_elements=["source_id", "request_key", "content_hash"], set_={"last_seen_at": stamp}))
+                index_elements=["source_id", "request_key", "content_hash"],
+                set_={"last_seen_at": stamp, "request_url": request_url or url, "url": url}))
 
     def html(self, url):
         return BeautifulSoup(self.fetch(url), "lxml")
 
-    def cached(self, content_type):
-        query = select(snapshots.c.url, snapshots.c.request_key, snapshots.c.content_gzip).where(
+    def cached(self, content_type, *, with_request_url=False):
+        query = select(snapshots.c.url, snapshots.c.request_url, snapshots.c.request_key, snapshots.c.content_gzip).where(
             snapshots.c.source_id == self.ctx.source_id, snapshots.c.http_status == 200,
             snapshots.c.content_type.startswith(content_type)).order_by(snapshots.c.last_seen_at.desc(), snapshots.c.id.desc())
         seen = set()
         with self.ctx.db.engine.connect() as conn:
-            for url, key, compressed in conn.execute(query):
+            for url, request_url, key, compressed in conn.execute(query):
                 if key not in seen:
                     seen.add(key)
-                    yield url, gzip.decompress(compressed)
+                    raw = gzip.decompress(compressed)
+                    yield (url, request_url or url, raw) if with_request_url else (url, raw)
 
     @abstractmethod
     def collect(self):

@@ -8,6 +8,7 @@ from sqlalchemy import String, cast, delete, func, or_, select, update
 from sqlalchemy.dialects.sqlite import insert
 
 from .db import attachments, digest, now, org, paper_keys, paper_org, patent_keys, records, sequences, tombstones
+from .errors import NotFound
 from .patent_identity import patent_key, patent_lookup_keys
 from .schema import REVIEW, SPECS, clean_values
 
@@ -194,11 +195,11 @@ def upsert_entry(conn, source_id, entry, *, return_id=False):
 
 
 def unit_links(conn, rows):
-    grouped = {row["id"]: [] for row in rows}
+    grouped = {row["id"]: {row["org_unit_id"]} if row["org_unit_id"] else set() for row in rows}
     for paper_id, unit_id in conn.execute(select(paper_org).where(paper_org.c.paper_id.in_(grouped)).order_by(paper_org.c.unit_id)):
-        grouped[paper_id].append(unit_id)
+        grouped[paper_id].add(unit_id)
     for row in rows:
-        row["org_unit_ids"] = grouped[row["id"]] or ([row["org_unit_id"]] if row["org_unit_id"] else [])
+        row["org_unit_ids"] = sorted(grouped[row["id"]])
     return rows
 
 
@@ -211,9 +212,9 @@ def write_record(conn, kind, record_id, body, *, import_key=None):
     spec, table = SPECS[kind], records[kind]
     values = clean_values(kind, body.values, validate=True)
     found = (conn.execute(select(table).where(table.c.id == record_id)).mappings().one_or_none()
-             if record_id else None)
-    if record_id and not found:
-        raise LookupError("记录不存在")
+             if record_id is not None else None)
+    if record_id is not None and not found:
+        raise NotFound("记录不存在")
     if found and body.expected_updated_at and body.expected_updated_at != found["updated_at"]:
         raise Conflict("记录已有更新，请重新打开后编辑")
     old = found["values"] if found else {}
@@ -232,7 +233,7 @@ def write_record(conn, kind, record_id, body, *, import_key=None):
     if requested_units and set(requested_units) != set(conn.scalars(select(org.c.id).where(
             org.c.id.in_(requested_units), org.c.archived.is_(False)))):
         raise ValueError("院系不存在")
-    if edit_paper_units:
+    if edit_paper_units and import_key is None:
         unit_id = None
     review = body.review_status or (found["review_status"] if found else "pending")
     if review not in REVIEW:
@@ -254,7 +255,7 @@ def write_record(conn, kind, record_id, body, *, import_key=None):
             raise Conflict(f"{spec.code}已存在")
         merged[spec.code] = code
     locked = set(found["locked_fields"] if found else ())
-    locked.update(key for key in values if import_key or merged.get(key) != old.get(key))
+    locked.update(key for key in values if merged.get(key) != old.get(key))
     if found:
         if found["source_url"] != source_url:
             locked.add("@source_url")
@@ -273,9 +274,11 @@ def write_record(conn, kind, record_id, body, *, import_key=None):
     if doi:
         conn.execute(insert(paper_keys).values(key=doi, record_id=record_id).on_conflict_do_nothing())
     if edit_paper_units:
-        conn.execute(delete(paper_org).where(paper_org.c.paper_id == record_id))
+        if import_key is None:
+            conn.execute(delete(paper_org).where(paper_org.c.paper_id == record_id))
         if paper_units:
-            conn.execute(insert(paper_org), [{"paper_id": record_id, "unit_id": unit} for unit in paper_units])
+            conn.execute(insert(paper_org).on_conflict_do_nothing(),
+                         [{"paper_id": record_id, "unit_id": unit} for unit in paper_units])
     result = dict(conn.execute(select(table).where(table.c.id == record_id)).mappings().one())
     return unit_links(conn, [result])[0] if kind == "papers" else result
 
@@ -327,7 +330,7 @@ def delete_record(db, kind, record_id, expected):
     with db.write() as conn:
         row = conn.execute(select(table.c.unique_key, table.c.updated_at).where(table.c.id == record_id)).one_or_none()
         if row is None:
-            raise LookupError("记录不存在")
+            raise NotFound("记录不存在")
         if expected and expected != row.updated_at:
             raise Conflict("记录已有更新，请重新打开后删除")
         keys = [row.unique_key]
@@ -356,7 +359,7 @@ def restore_tombstone(db, kind, key):
         row = conn.execute(select(tombstones.c.record_key).where(
             tombstones.c.kind == kind, tombstones.c.key == key)).one_or_none()
         if row is None:
-            raise LookupError("找不到指定的采集拦截标记")
+            raise NotFound("找不到指定的采集拦截标记")
         matches = tombstones.c.key == key
         if row.record_key:
             matches = or_(matches, tombstones.c.record_key == row.record_key)

@@ -1,6 +1,7 @@
 timezone: Asia/Shanghai
 attachments:
   max_bytes: 52428800
+  private_host_networks: {}
   source_hosts:
     ecnu_kjc_transfer: [kjc.ecnu.edu.cn]
     shanghai_policies: [kjy.ecnu.edu.cn]

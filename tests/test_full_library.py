@@ -1,9 +1,11 @@
 import csv
 import gzip
 import json
+import sqlite3
 import subprocess
 import sys
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -18,17 +20,18 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, insert, select, update
 
 import cli
-from app.attachments import Original, clean_filename, fetch_original
+from app.attachments import LinkOnly, Original, clean_filename, fetch_original
 from app.collectors import COLLECTORS
-from app.collectors.faculty import FacultyCollector, research_keywords
+from app.collectors.faculty import FacultyCollector, ProfileBatch, profile_key, research_keywords
 from app.collectors.openalex import OpenAlexCollector
 from app.collectors.park import ScienceParkCollector
 from app.collectors.policies import PolicyCollector
 from app.collectors.transfer import TransferCollector, person_names
-from app.db import Database, ROOT, digest, now, records, runs, snapshots, sources
-from app.export import school_coverage_csv
+from app.db import Database, ROOT, digest, now, org, paper_keys, records, runs, snapshots, sources
+from app.errors import Cancelled
+from app.export import school_coverage_csv, school_paper_links_csv
 from app.main import create_app
-from app.runner import RunManager
+from app.runner import RunContext, RunManager
 from app.store import Conflict, Entry, Unit, delete_record, sync_units, units, upsert_entry
 
 TRANSFER = "ecnu_kjc_transfer"
@@ -162,6 +165,14 @@ class FullLibrary(unittest.TestCase):
         self.assertFalse(entry.attachments[0].fetchable)
         self.assertIsNone(entry.attachments[0].content)
 
+    def test_faculty_strips_role_and_transliteration_from_chinese_names(self):
+        collector = self.collector(FacultyCollector, FACULTY)
+        page = BeautifulSoup("<main></main>", "lxml")
+        for raw, expected in (("刘少英 (Shaoying Liu)", "刘少英"), ("刘路 博士生导师 有机化学学科组长", "刘路"),
+                              ("夏飞 教授, 物化博导", "夏飞"), ("Maria Garcia", "Maria Garcia")):
+            with self.subTest(name=raw):
+                self.assertEqual(collector.profile_values(page, {"title": raw}, "甲院")["姓名"], expected)
+
     def test_faculty_recent_profile_skips_only_incrementally(self):
         collector = self.collector(FacultyCollector, FACULTY)
         collector.options["skip_recent_days"] = 7
@@ -209,6 +220,170 @@ class FullLibrary(unittest.TestCase):
         self.assertEqual([source["source_id"] for source in report["sources"]], [FACULTY, PAPERS, TRANSFER])
         self.assertEqual([source["status"] for source in report["sources"]], ["conflict", "failed", "succeeded"])
         self.assertEqual((report["failed"], report["skipped"]), (2, 3))
+
+    def test_faculty_uses_detail_budget_after_recent_profiles(self):
+        home = "https://faculty.ecnu.edu.cn"
+        recent, fresh = f"{home}/recent/main.psp", f"{home}/fresh/main.psp"
+        api_url = f"{home}/?wp_tw_orgId=example"
+        sync_units(self.db, [Unit("a", "测试学院", "学院", faculty_url=api_url)])
+        unit, = units(self.db)
+        with self.db.write() as conn:
+            upsert_entry(conn, FACULTY, Entry("faculty", profile_key(recent), {"姓名": "王一"}, recent))
+        collector = self.collector(FacultyCollector, FACULTY)
+        collector.ctx.mode, collector.ctx.log = "incremental", Mock()
+        collector.ctx.count, collector.ctx.emit, collector.ctx.failure = Mock(), Mock(), Mock()
+        collector.options.update(max_teachers_per_unit=1, skip_recent_days=7)
+        first = {"cnUrl": recent, "title": "王一"}
+        second = {"cnUrl": fresh, "title": "王二"}
+        with patch.object(collector, "directory_api", side_effect=[{"data": [first] * 52, "total": 53},
+                                                                  {"data": [second], "total": 53}]) as directory, \
+             patch.object(collector, "fetch", return_value=b"<main>Profile</main>") as fetch:
+            collector.collect_unit(unit)
+        self.assertEqual(directory.call_count, 2)
+        fetch.assert_called_once_with(fresh)
+
+        with patch.object(collector, "department_pages", return_value=iter([(home, [first]), (home, [second])])), \
+             patch.object(collector, "fetch", return_value=b"<main>Profile</main>") as fetch:
+            collector.collect_department(unit, {"url": home}, 1)
+        fetch.assert_called_once_with(fresh)
+
+        with patch.object(collector, "html", return_value=BeautifulSoup(
+                '<a href="/recent/main.psp">王一</a><a href="/fresh/main.psp">王二</a>', "lxml")), \
+             patch.dict(collector.selectors, {"teacher_link": "a"}), \
+             patch.object(collector, "fetch", return_value=b"<main>Profile</main>") as fetch:
+            collector.collect_unit(unit | {"faculty_url": home})
+        fetch.assert_called_once_with(fresh)
+        self.assertEqual(collector.ctx.count.call_args_list, [call("skipped")] * 54)
+        collector.ctx.failure.assert_not_called()
+
+    def test_faculty_rotation_tracks_attempts_and_defers_retry(self):
+        home = "https://faculty.ecnu.edu.cn"
+        roster = [Unit("a", "甲院", "学院", faculty_url=f"{home}/a"),
+                  Unit("b", "乙院", "学院", faculty_url=f"{home}/b")]
+        sync_units(self.db, roster)
+        failed = next(str(row["id"]) for row in units(self.db) if row["name"] == "甲院")
+        manager = RunManager(self.db)
+        with patch.object(FacultyCollector, "discover", return_value=roster), \
+             patch.object(FacultyCollector, "collect_unit", side_effect=[ValueError("暂时失败"), ProfileBatch(), ProfileBatch()]) as collect:
+            first = manager.execute(FACULTY, overrides={"max_units": 1})
+            cursor = self.db.source(FACULTY)["cursor_json"]
+            self.assertIn(failed, cursor["faculty_units"])
+            self.assertIn(failed, cursor["faculty_unit_retries"])
+            second = manager.execute(FACULTY, overrides={"max_units": 1})
+            cursor = self.db.source(FACULTY)["cursor_json"]
+            cursor["faculty_unit_retries"][failed]["after"] = "2000-01-01T00:00:00+00:00"
+            with self.db.write() as conn:
+                conn.execute(update(sources).where(sources.c.id == FACULTY).values(cursor_json=cursor))
+            third = manager.execute(FACULTY, overrides={"max_units": 1})
+        self.assertEqual([c.args[0]["name"] for c in collect.call_args_list], ["甲院", "乙院", "甲院"])
+        self.assertEqual([item["status"] for item in (first, second, third)], ["partial"] * 3)
+        source = self.db.source(FACULTY)
+        self.assertIsNone(source["last_synced_at"])
+        self.assertIsNotNone(source["last_batch_at"])
+        self.assertEqual(source["cursor_json"]["faculty_unit_retries"], {})
+
+    def test_faculty_detail_limit_reports_partial_only_with_remaining_work(self):
+        home = "https://faculty.ecnu.edu.cn"
+        roster = [Unit("a", "甲院", "学院", faculty_url=f"{home}/?wp_tw_orgId=example")]
+        rows = [{"cnUrl": f"{home}/profile/{i}", "title": f"教师{i}"} for i in range(52)]
+        manager = RunManager(self.db)
+        options = {"max_units": 0, "max_teachers_per_unit": 5}
+        with patch.object(FacultyCollector, "discover", return_value=roster), \
+             patch.object(FacultyCollector, "directory_api", side_effect=[{"data": rows, "total": 80},
+                                                                         {"data": rows[:5], "total": 5}]), \
+             patch.object(FacultyCollector, "fetch", return_value=b"<main>Profile</main>") as fetch:
+            truncated = manager.execute(FACULTY, overrides=options)
+            self.assertEqual(truncated["status"], "partial")
+            self.assertEqual(fetch.call_count, 5)
+            self.assertIsNone(self.db.source(FACULTY)["last_synced_at"])
+            complete = manager.execute(FACULTY, overrides=options)
+            self.assertEqual(complete["status"], "succeeded")
+            self.assertEqual(fetch.call_count, 10)
+            self.assertIsNotNone(self.db.source(FACULTY)["last_synced_at"])
+
+    def test_faculty_profile_limit_checks_static_and_paginated_department_remainders(self):
+        home = "https://faculty.ecnu.edu.cn"
+        first, second = f"{home}/first", f"{home}/second"
+        collector = self.collector(FacultyCollector, FACULTY)
+        collector.ctx.log, collector.ctx.emit = Mock(), Mock()
+        collector.options["max_teachers_per_unit"] = 1
+        unit = {"id": 1, "name": "甲院", "faculty_url": home}
+        listing = BeautifulSoup('<a href="/first">王一</a><a href="/second">王二</a>', "lxml")
+        with patch.object(collector, "html", return_value=listing), patch.dict(collector.selectors, {"teacher_link": "a"}), \
+             patch.object(collector, "fetch", return_value=b"<main>Profile</main>") as fetch:
+            self.assertTrue(collector.collect_unit(unit).truncated)
+        fetch.assert_called_once_with(first)
+
+        pages = iter([(home, [{"cnUrl": first, "title": "王一"}]), (home, [{"cnUrl": second, "title": "王二"}])])
+        with patch.object(collector, "department_pages", return_value=pages), \
+             patch.object(collector, "fetch", return_value=b"<main>Profile</main>") as fetch:
+            self.assertTrue(collector.collect_department(unit, {"url": home}, 1).truncated)
+        fetch.assert_called_once_with(first)
+
+    def test_faculty_all_detail_failures_schedule_unit_retry(self):
+        home = "https://faculty.ecnu.edu.cn"
+        roster = [Unit("a", "甲院", "学院", faculty_url=f"{home}/?wp_tw_orgId=example")]
+        rows = [{"cnUrl": f"{home}/profile/{i}", "title": f"教师{i}"} for i in range(2)]
+        manager = RunManager(self.db)
+        options = {"max_units": 0, "max_teachers_per_unit": 0}
+        with patch.object(FacultyCollector, "discover", return_value=roster), \
+             patch.object(FacultyCollector, "directory_api", return_value={"data": rows, "total": 2}) as directory, \
+             patch.object(FacultyCollector, "fetch", side_effect=[httpx.ReadTimeout("timeout"), httpx.ReadTimeout("timeout"),
+                                                                 httpx.ReadTimeout("timeout"), b"<main>Profile</main>"]):
+            failed = manager.execute(FACULTY, overrides=options)
+            self.assertEqual((failed["status"], failed["failed"]), ("partial", 2))
+            unit, = units(self.db)
+            key = str(unit["id"])
+            cursor = self.db.source(FACULTY)["cursor_json"]
+            self.assertIn(key, cursor["faculty_units"])
+            self.assertEqual(cursor["faculty_unit_retries"][key]["failures"], 1)
+            deferred = manager.execute(FACULTY, overrides=options)
+            self.assertEqual(deferred["status"], "partial")
+            self.assertEqual(directory.call_count, 1)
+            mixed = manager.execute(FACULTY, overrides=options | {"unit_ids": [unit["id"]]})
+        self.assertEqual((mixed["status"], mixed["failed"]), ("partial", 1))
+        self.assertEqual(self.db.source(FACULTY)["cursor_json"]["faculty_unit_retries"], {})
+
+    def test_redirect_snapshot_refresh_and_replay_use_entry_url(self):
+        entry = "http://faculty.ecnu.edu.cn/profile-entry"
+        final = "https://faculty.ecnu.edu.cn/profile-destination"
+        sync_units(self.db, [Unit("a", "甲院", "学院")])
+        unit, = units(self.db)
+        with self.db.write() as conn:
+            upsert_entry(conn, FACULTY, Entry("faculty", profile_key(entry), {"姓名": "王一"}, entry, org_id=unit["id"]))
+            conn.execute(update(records["faculty"]).values(updated_at="2000-01-01T00:00:00+00:00"))
+        manager = RunManager(self.db)
+        run_id, started = manager.claim(FACULTY, "incremental", "test")
+        context = RunContext(manager, self.db.source(FACULTY), run_id, started, "incremental", {"skip_recent_days": 7}, False)
+        collector = FacultyCollector(context)
+
+        def respond(request):
+            if str(request.url) == entry:
+                return httpx.Response(302, headers={"Location": final})
+            self.assertEqual(str(request.url), final)
+            return httpx.Response(200, headers={"Content-Type": "text/html"}, content=b"<main>Profile</main>")
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+            collector.client = client
+            collector.fetch(entry)
+        with self.db.engine.connect() as conn:
+            self.assertEqual(tuple(conn.execute(select(snapshots.c.url, snapshots.c.request_url)).one()), (final, entry))
+        collector.snapshot("https://sso.ecnu.edu.cn/login", "login", b"<main>Login</main>", "text/html", 200,
+                           request_url=entry)
+        with patch.object(collector, "fetch", side_effect=AssertionError("联网")) as fetch, \
+             patch.object(collector, "profile_values", return_value={"姓名": "王一", "职称": "教授"}) as parse:
+            self.assertEqual(collector.profiles(unit, [{"cnUrl": entry, "title": "王一"}]).attempted, 0)
+            collector.replay()
+        fetch.assert_not_called()
+        parse.assert_called_once()
+        self.assertIn("Profile", parse.call_args.args[0].get_text())
+        with self.db.engine.connect() as conn:
+            self.assertEqual(conn.scalar(select(records["faculty"].c["values"]))["职称"], "教授")
+
+    def test_run_all_preserves_partial_when_no_source_failed(self):
+        manager = Mock()
+        manager.execute.side_effect = [{"status": "partial"}, {"status": "succeeded"}, {"status": "succeeded"}]
+        self.assertEqual(cli.run_all(manager, "school", {})["status"], "partial")
 
     def test_transfer_cleans_names_without_splitting_latin_surname(self):
         self.assertEqual(person_names(" 王 一；李二, 张三 /王一", " YU, Jiahui, LU, Wei, YU, Jiahui"),
@@ -319,6 +494,8 @@ class FullLibrary(unittest.TestCase):
 
         def serve(request):
             calls.append(str(request.url))
+            self.assertEqual(request.headers["Host"], "kjy.ecnu.edu.cn")
+            self.assertEqual(request.extensions["sni_hostname"], "kjy.ecnu.edu.cn")
             if len(calls) == 1:
                 raise httpx.ConnectTimeout("transient", request=request)
             if len(calls) == 2:
@@ -326,15 +503,143 @@ class FullLibrary(unittest.TestCase):
             return httpx.Response(200, headers={"Content-Type": "application/pdf"}, content=b"%PDF-1.4\nfixture")
 
         client = httpx.Client
-        ctx = SimpleNamespace(source_id=POLICY, asset_wait=lambda: None, log=lambda *_: None)
+        ctx = SimpleNamespace(source_id=POLICY, asset_wait=lambda: None, log=lambda *_: None, wait=Mock())
         with patch("app.attachments.httpx.Client", side_effect=lambda **kw: client(transport=httpx.MockTransport(serve), **kw)), \
-             patch("app.attachments.time.sleep") as wait:
+             patch("app.attachments.socket.getaddrinfo", return_value=[(None, None, None, "", ("93.184.216.34", 443))]):
             metadata, filename = fetch_original(self.db,
                 Original("policy_attachment", "https://kjy.ecnu.edu.cn/demo.pdf"), clean_filename(".pdf"), ctx)
         self.assertEqual(filename, "原件.pdf")
-        self.assertEqual(len(calls), 3)
-        self.assertEqual([arg.args[0] for arg in wait.call_args_list], [1.0, 2.0])
+        self.assertEqual(calls, ["https://93.184.216.34/demo.pdf"] * 3)
+        self.assertEqual(ctx.wait.call_args_list, [call(1.0), call(2.0)])
         self.assertEqual(metadata["mime_type"], "application/pdf")
+
+    def test_attachment_rejects_nonpublic_addresses_at_each_redirect(self):
+        target = "https://kjy.ecnu.edu.cn/demo.pdf"
+        def resolved(host, port, **kwargs):
+            address = "93.184.216.34" if host == "kjy.ecnu.edu.cn" else "::ffff:127.0.0.1"
+            return [(None, None, None, "", (address, port))]
+
+        send = Mock(return_value=httpx.Response(302, headers={"Location": "https://files.kjy.ecnu.edu.cn/redirect.pdf"}))
+        client = httpx.Client
+        ctx = SimpleNamespace(source_id=POLICY, asset_wait=Mock(), log=Mock(), wait=Mock())
+        with patch("app.attachments.httpx.Client", side_effect=lambda **kw: client(transport=httpx.MockTransport(send), **kw)), \
+             patch("app.attachments.socket.getaddrinfo", side_effect=resolved):
+            with self.assertRaisesRegex(LinkOnly, "非公网"):
+                fetch_original(self.db, Original("policy_attachment", target), "demo.pdf", ctx)
+        self.assertEqual(send.call_count, 1)
+
+    def test_attachment_private_dns_requires_exact_host_and_approved_network(self):
+        host = "kjy.ecnu.edu.cn"
+        url = f"https://{host}/file.pdf"
+        from_private = Original("policy_attachment", url)
+        address = "10.25.8.42"
+
+        def resolved(_host, port, **kwargs):
+            return [(None, None, None, "", (address, port))]
+
+        def serve(request):
+            self.assertEqual(request.url.host, "10.25.8.42")
+            self.assertEqual(request.headers["Host"], host)
+            self.assertEqual(request.extensions["sni_hostname"], host)
+            return httpx.Response(200, content=b"%PDF-1.4\nfixture", headers={"Content-Type": "application/pdf"})
+
+        client = httpx.Client
+        send = Mock(side_effect=serve)
+        ctx = SimpleNamespace(source_id=POLICY, asset_wait=Mock(), log=Mock(), wait=Mock())
+        with patch("app.attachments.httpx.Client", side_effect=lambda **kw: client(transport=httpx.MockTransport(send), **kw)), \
+             patch("app.attachments.socket.getaddrinfo", side_effect=resolved):
+            with self.assertRaises(LinkOnly):
+                fetch_original(self.db, from_private, "file.pdf", ctx)
+            self.db.config["attachments"]["private_host_networks"] = {host: ["10.25.8.42/32"]}
+            meta, _ = fetch_original(self.db, from_private, "file.pdf", ctx)
+            self.assertEqual(meta["mime_type"], "application/pdf")
+            with self.assertRaises(LinkOnly):
+                fetch_original(self.db, Original("policy_attachment", f"https://files.{host}/file.pdf"), "file.pdf", ctx)
+            address = "10.25.8.43"
+            with self.assertRaises(LinkOnly):
+                fetch_original(self.db, from_private, "file.pdf", ctx)
+            self.db.config["attachments"]["private_host_networks"][host] = ["127.0.0.0/8"]
+            with self.assertRaisesRegex(ValueError, "RFC 1918"):
+                fetch_original(self.db, from_private, "file.pdf", ctx)
+        self.assertEqual(send.call_count, 1)
+
+    def test_cancel_interrupts_retry_wait(self):
+        manager = RunManager(self.db)
+        run_id, started = manager.claim(FACULTY, "incremental", "test")
+        context = RunContext(manager, self.db.source(FACULTY), run_id, started, "incremental", {}, False)
+        manager.cancel(run_id)
+        with self.assertRaises(Cancelled):
+            context.wait(30)
+
+    def test_archived_units_do_not_add_blank_paper_rows(self):
+        sync_units(self.db, [Unit("a", "甲院", "学院"), Unit("b", "乙院", "学院")])
+        a, b = [row["id"] for row in units(self.db)]
+        with self.db.write() as conn:
+            upsert_entry(conn, PAPERS, Entry("papers", "one", {"论文标题": "有有效院系"}, "", org_ids=(a, b)))
+            upsert_entry(conn, PAPERS, Entry("papers", "two", {"论文标题": "仅归档院系"}, "", org_ids=(b,)))
+            conn.execute(update(org).where(org.c.id == b).values(archived=True))
+            out = school_paper_links_csv(conn, None)
+        first, second = csv.DictReader(StringIO(out.decode("utf-8-sig")))
+        self.assertEqual((first["论文标题"], first["院系ID"]), ("有有效院系", str(a)))
+        self.assertEqual((second["论文标题"], second["归属依据"]), ("仅归档院系", "待补充"))
+
+    def test_audit_schema_migration_preserves_legacy_rows_and_adds_cascade(self):
+        with self.db.write() as conn:
+            conn.exec_driver_sql("ALTER TABLE raw_snapshots DROP COLUMN request_url")
+            conn.exec_driver_sql("DROP TABLE paper_keys")
+            conn.exec_driver_sql("CREATE TABLE paper_keys (key VARCHAR NOT NULL PRIMARY KEY, "
+                                 "record_id INTEGER NOT NULL REFERENCES kb_papers(id))")
+            _, record_id = upsert_entry(conn, PAPERS, Entry("papers", "paper", {"论文标题": "旧论文"}, "",
+                                                           aliases=("doi:10.1000/legacy",)), return_id=True)
+            self.snapshot(conn, FACULTY, "https://faculty.ecnu.edu.cn/old", "<main>旧页面</main>")
+        self.db.engine.dispose()
+        with closing(sqlite3.connect(self.path)) as legacy:
+            self.assertEqual(legacy.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+
+        save = self.db.backup_before_migration
+
+        def backup_without_write_lock():
+            with closing(sqlite3.connect(self.path, timeout=0)) as probe:
+                probe.execute("BEGIN IMMEDIATE")
+                probe.rollback()
+            save()
+
+        with patch.object(self.db, "backup_before_migration", side_effect=backup_without_write_lock) as backup_call:
+            self.db.initialize()
+            self.db.initialize()
+        backup_call.assert_called_once()
+        backup, = (self.path.parent / "backups").glob("before-schema-*.sqlite3")
+        with closing(sqlite3.connect(backup.as_uri() + "?mode=ro", uri=True)) as original:
+            self.assertNotIn("request_url", [row[1] for row in original.execute("PRAGMA table_info(raw_snapshots)")])
+            self.assertEqual(original.execute("SELECT key FROM paper_keys").fetchall(), [("doi:10.1000/legacy",)])
+        with self.db.write() as conn:
+            self.assertEqual(conn.scalar(select(paper_keys.c.record_id)), record_id)
+            snap = conn.execute(select(snapshots.c.url, snapshots.c.request_url)).one()
+            self.assertEqual(tuple(snap), ("https://faculty.ecnu.edu.cn/old", None))
+            conn.execute(delete(records["papers"]).where(records["papers"].c.id == record_id))
+            self.assertIsNone(conn.scalar(select(paper_keys.c.record_id)))
+            self.assertEqual(conn.exec_driver_sql("PRAGMA foreign_key_check").all(), [])
+
+    def test_schema_backup_retries_if_another_connection_commits(self):
+        with self.db.write() as conn:
+            conn.exec_driver_sql("ALTER TABLE raw_snapshots DROP COLUMN request_url")
+        save = self.db.backup_before_migration
+        wrote = False
+
+        def backup_with_one_concurrent_commit():
+            nonlocal wrote
+            save()
+            if not wrote:
+                with self.db.write() as conn:
+                    self.snapshot(conn, FACULTY, "https://faculty.ecnu.edu.cn/concurrent", "<main>并发保存</main>")
+                wrote = True
+
+        with patch.object(self.db, "backup_before_migration", side_effect=backup_with_one_concurrent_commit) as backup:
+            self.db.initialize()
+        self.assertEqual(backup.call_count, 2)
+        copy = max((self.path.parent / "backups").glob("before-schema-*.sqlite3"))
+        with closing(sqlite3.connect(copy)) as original:
+            self.assertEqual(original.execute("SELECT count(*) FROM raw_snapshots").fetchone()[0], 1)
 
     def test_openalex_old_order_starts_new_window(self):
         prior = {"publication": {"inflight": {
@@ -435,3 +740,21 @@ class FullLibrary(unittest.TestCase):
             self.assertEqual(conn.execute(select(runs.c.status, runs.c.trigger).order_by(runs.c.id)).all(),
                              [("failed", "schedule"), ("succeeded", "schedule")])
         self.assertEqual(self.db.source(PARK)["cursor_json"]["integration"], {"position": 4})
+
+    def test_web_start_reaps_stale_runs_with_schedule_disabled(self):
+        old = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        manager = RunManager(self.db)
+        stale, _ = manager.claim(FACULTY, "incremental", "test")
+        active, _ = manager.claim(PAPERS, "incremental", "test")
+        with self.db.write() as conn:
+            conn.execute(update(runs).where(runs.c.id == stale).values(heartbeat_at=old))
+            conn.execute(insert(runs), [dict(source_id=PARK, mode="incremental", trigger="test", status="succeeded",
+                                            started_at=old, heartbeat_at=old) for _ in range(31)])
+        with TestClient(create_app(self.path)) as client:
+            self.assertEqual(client.get(f"/api/runs/{stale}/logs").json()["run"]["status"], "failed")
+            self.assertNotIn(active, {row["id"] for row in client.get("/api/runs").json()})
+            flags = {source["id"]: source["running"] for source in client.get("/api/sources").json()}
+            self.assertFalse(flags[FACULTY])
+            self.assertTrue(flags[PAPERS])
+            with self.assertRaises(Conflict):
+                manager.claim(PAPERS, "incremental", "test")

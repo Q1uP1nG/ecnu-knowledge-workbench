@@ -1,6 +1,7 @@
 import json
 import re
 import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from itertools import islice
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -10,6 +11,7 @@ from sqlalchemy import func, select
 
 from ..attachments import Original
 from ..db import now, org, records, snapshots
+from ..errors import Cancelled
 from ..store import Entry, Unit, descendants, sync_units, units
 from .base import BaseCollector, clean, link, preferred, text_of
 
@@ -38,6 +40,14 @@ KEYWORD_LEAD = re.compile(
 )
 
 
+@dataclass
+class ProfileBatch:
+    limit: int | None = None
+    attempted: int = 0
+    failed: int = 0
+    truncated: bool = False
+
+
 def balanced_brackets(text):
     stack, remove = [], set()
     pairs = {")": "(", "）": "（"}
@@ -63,6 +73,12 @@ def profile_key(url):
 
 def norm(name):
     return "".join(char for char in unicodedata.normalize("NFKC", name or "").casefold() if char.isalnum())
+
+
+def person_name(value):
+    name = clean(value)
+    name = re.sub(r"^([\u3400-\u9fff·]{2,8})\s*[（(][A-Za-z][A-Za-z .'-]*[）)]$", r"\1", name)
+    return re.sub(rf"^([\u3400-\u9fff·]{{2,8}})[\s,，、]+(?:博士生导师|硕士生导师|{RANK.pattern}).*$", r"\1", name)
 
 
 def profile_rank(body, name):
@@ -192,6 +208,8 @@ class FacultyCollector(BaseCollector):
                         faculty.setdefault(name, f'{self.config["faculty_unit"]}?{query}')
                 if not payload["data"] or page * 100 >= int(payload.get("total") or 0):
                     break
+        except Cancelled:
+            raise
         except Exception as exc:
             self.ctx.failure(f"教师主页目录读取失败：{exc}", self.config["faculty_directory"])
         for name, site in self.config.get("department_sources", {}).items():
@@ -230,6 +248,7 @@ class FacultyCollector(BaseCollector):
             raise ValueError("没有可采集的院系教师目录")
         max_units = self.options.get("max_units") or len(targets)
         last = dict(self.ctx.previous_cursor.get("faculty_units") or {})
+        retries = dict(self.ctx.previous_cursor.get("faculty_unit_retries") or {})
         if not last:
             faculty = records["faculty"]
             with self.ctx.db.engine.connect() as conn:
@@ -237,30 +256,57 @@ class FacultyCollector(BaseCollector):
                         .where(faculty.c.source_id == self.ctx.source_id, faculty.c.org_unit_id.is_not(None))
                         .group_by(faculty.c.org_unit_id)):
                     last[str(unit_id)] = stamp
+        eligible = targets
         if not only and self.ctx.mode == "incremental":
-            targets.sort(key=lambda unit: (last.get(str(unit["id"]), ""), unit["id"]))
-        for unit in targets[:max_units]:
+            stamp = now()
+            eligible = [unit for unit in targets if retries.get(str(unit["id"]), {}).get("after", "") <= stamp]
+            eligible.sort(key=lambda unit: (str(unit["id"]) not in retries,
+                                            last.get(str(unit["id"]), ""), unit["id"]))
+        batch = eligible[:max_units]
+        if len(batch) < len(targets):
+            self.ctx.partial = True
+        for unit in batch:
+            key = str(unit["id"])
             try:
-                self.collect_unit(unit)
+                details = self.collect_unit(unit)
+            except Cancelled:
+                raise
             except Exception as exc:
                 self.ctx.failure(f'{unit["name"]}：{exc}', unit["faculty_url"])
-            last[str(unit["id"])] = now()
-            self.ctx.checkpoint("faculty_units", last)
+                retry = True
+            else:
+                self.ctx.partial |= details.truncated
+                retry = details.attempted > 0 and details.attempted == details.failed
+                if retry:
+                    self.ctx.log("warning", f'{unit["name"]}：本批 {details.attempted} 个教师详情均失败，将退避重试',
+                                 unit["faculty_url"])
+            if retry:
+                failures = retries.get(key, {}).get("failures", 0) + 1
+                retry_at = datetime.now(timezone.utc) + timedelta(hours=2 ** min(failures - 1, 7))
+                retries[key] = {"failures": failures, "after": retry_at.isoformat(timespec="microseconds")}
+            else:
+                retries.pop(key, None)
+            last[key] = now()
+            self.ctx.checkpoint("faculty_units", last, faculty_unit_retries=retries)
 
     def replay(self):
         table = records["faculty"]
+        profiles = {}
         with self.ctx.db.engine.connect() as conn:
-            profiles = {row["source_url"] or row["unique_key"]: row for row in conn.execute(
-                select(table).where(table.c.source_id == self.ctx.source_id)).mappings()}
+            for row in conn.execute(select(table).where(table.c.source_id == self.ctx.source_id)).mappings():
+                url = row["source_url"] or row["unique_key"]
+                profiles[url] = row
+                profiles.setdefault(profile_key(url), row)
         api_ranks = {self.config["faculty_query"]: ("career", ())}
         for site in self.config.get("department_sources", {}).values():
             api = site.get("api", {})
             if api.get("rank_field"):
                 api_ranks[api["url"]] = (api["rank_field"], site.get("https_hosts", ()))
         careers, pages = {}, {}
-        for url, raw in self.cached(""):
-            if url in api_ranks:
-                rank_field, https_hosts = api_ranks[url]
+        for url, request_url, raw in self.cached("", with_request_url=True):
+            directory = api_ranks.get(url) or api_ranks.get(request_url)
+            if directory:
+                rank_field, https_hosts = directory
                 try:
                     items = json.loads(raw).get("data") or []
                 except (ValueError, AttributeError):
@@ -272,12 +318,14 @@ class FacultyCollector(BaseCollector):
                         if target.startswith("http://") and urlsplit(target).hostname in https_hosts:
                             target = target.replace("http://", "https://", 1)
                         careers.setdefault(profile_key(target), career)
-            elif url in profiles:
-                pages.setdefault(url, raw)
+            elif urlsplit(url).hostname != "sso.ecnu.edu.cn":
+                row = profiles.get(url) or profiles.get(request_url) or profiles.get(profile_key(url))
+                if row:
+                    pages.setdefault(row["id"], (row, raw))
         parsed = 0
-        for url, raw in pages.items():
+        for row, raw in pages.values():
             self.ctx.heartbeat()
-            row = profiles[url]
+            url = row["source_url"] or row["unique_key"]
             old = row["values"]
             try:
                 values = self.profile_values(BeautifulSoup(raw, "lxml"), {
@@ -286,6 +334,8 @@ class FacultyCollector(BaseCollector):
                     values["职称"] = old.get("职称")
                 self.emit_profile(values, url, row["org_unit_id"], raw)
                 parsed += 1
+            except Cancelled:
+                raise
             except Exception as exc:
                 self.ctx.failure(f"教师快照解析失败：{exc}", url)
         self.ctx.log("info", f"本地教师快照重解析 · {parsed} 人")
@@ -297,18 +347,16 @@ class FacultyCollector(BaseCollector):
         self.ctx.log("info", f'读取 {unit["name"]} 师资目录', directory_url)
         department = self.config.get("department_sources", {}).get(unit["name"])
         if department and directory_url == department["url"]:
-            self.collect_department(unit, department, cap)
-            return
+            return self.collect_department(unit, department, cap)
+        batch = ProfileBatch(cap)
         if not directory_id:
             if urlsplit(directory_url).hostname != "faculty.ecnu.edu.cn":
                 raise ValueError("师资目录必须位于 faculty.ecnu.edu.cn")
             soup = self.html(directory_url)
             urls = dict.fromkeys(link(directory_url, a.get("href"), "faculty.ecnu.edu.cn")
                                  for a in soup.select(self.selectors["teacher_link"]))
-            self.profiles(unit, [{"cnUrl": url} for url in list(filter(None, urls))[:cap]])
-            return
-        size = min(cap, 52) if cap else 52
-        remaining = cap
+            return self.profiles(unit, [{"cnUrl": url} for url in filter(None, urls)], batch=batch)
+        size = 52
         for page in range(1, 501):
             conditions = [{"field": field, "value": value, "judge": judge} for field, value, judge in
                           (("language", 1, "="), ("ownDepartment", directory_id, "="),
@@ -319,17 +367,17 @@ class FacultyCollector(BaseCollector):
                 "pageEvent": "dataSearchByPageIndex",
                 "returnInfos": return_fields("title career visitCount headerPic cnUrl department publishStatus"),
             }, directory_url)
-            items = payload["data"][:remaining]
-            self.profiles(unit, items)
-            if remaining is not None:
-                remaining -= len(items)
-            if not items or remaining == 0 or page * size >= int(payload.get("total") or 0):
-                return
+            items = payload["data"]
+            self.profiles(unit, items, batch=batch)
+            total = payload.get("total")
+            last_page = page * size >= int(total) if total not in (None, "") else len(items) < size
+            if batch.truncated or not items or last_page:
+                return batch
         raise ValueError("师资目录超过分页保护上限")
 
     def collect_department(self, unit, config, cap):
         seen_pages, seen_profiles = set(), set()
-        collected = 0
+        batch = ProfileBatch(cap)
         for initial in dict.fromkeys((config["url"], *config.get("urls", []))):
             for source, candidates in self.department_pages(initial, config, seen_pages):
                 host = urlsplit(source).hostname
@@ -344,13 +392,12 @@ class FacultyCollector(BaseCollector):
                     if identity not in seen_profiles:
                         rows.append(item | {"cnUrl": target})
                         seen_profiles.add(identity)
-                remaining = None if cap is None else cap - collected
-                self.profiles(unit, rows[:remaining], department=True)
-                collected += len(rows[:remaining])
-                if cap is not None and collected >= cap:
-                    return
-        if not collected:
+                self.profiles(unit, rows, department=True, batch=batch)
+                if batch.truncated:
+                    return batch
+        if not seen_profiles:
             raise ValueError("未在院系官网名录匹配到教师主页")
+        return batch
 
     def department_pages(self, initial, config, seen_pages):
         first_page = None
@@ -410,7 +457,9 @@ class FacultyCollector(BaseCollector):
             return prior
         return unit
 
-    def profiles(self, unit, items, *, department=False):
+    def profiles(self, unit, items, *, department=False, batch=None):
+        if batch is None:
+            batch = ProfileBatch()
         targets = [(row, link(self.config["faculty_unit"], row.get("cnUrl"),
                              None if department else "faculty.ecnu.edu.cn")) for row in items]
         recent = set()
@@ -429,9 +478,11 @@ class FacultyCollector(BaseCollector):
                     candidates[key] = key
                     if url:
                         candidates.setdefault(url, key)
-                recent.update(candidates[url] for url in conn.scalars(select(snapshots.c.url).where(
-                    snapshots.c.source_id == "ecnu_faculty", snapshots.c.http_status == 200,
-                    snapshots.c.url.in_(candidates), snapshots.c.last_seen_at > cutoff).distinct()))
+                for url, request_url in conn.execute(select(snapshots.c.url, snapshots.c.request_url).where(
+                        snapshots.c.source_id == "ecnu_faculty", snapshots.c.http_status == 200,
+                        snapshots.c.url.in_(candidates) | snapshots.c.request_url.in_(candidates),
+                        snapshots.c.last_seen_at > cutoff).distinct()):
+                    recent.update(candidates[link] for link in (url, request_url) if link in candidates)
         for row, url in targets:
             if not url:
                 self.ctx.failure("师资目录条目缺少教师主页地址")
@@ -439,12 +490,16 @@ class FacultyCollector(BaseCollector):
             if profile_key(url) in recent:
                 self.ctx.count("skipped")
                 continue
+            if batch.limit is not None and batch.attempted >= batch.limit:
+                batch.truncated = True
+                break
+            batch.attempted += 1
             try:
                 raw = self.fetch(url)
                 response_url = getattr(self, "response_url", url)
                 target = unit if department else self.canonical_unit(unit, url)
                 if urlsplit(response_url).hostname == "sso.ecnu.edu.cn":
-                    name = clean(row.get("title"))
+                    name = person_name(row.get("title"))
                     rank = RANK.search(clean(row.get("career")))
                     self.ctx.log("info", "公开名录可见，教师详情需要登录", url)
                     self.emit_profile({"姓名": name, "职称": rank.group() if rank else None,
@@ -457,8 +512,12 @@ class FacultyCollector(BaseCollector):
                     url = response_url
                 values = self.profile_values(soup, row, target["name"], department=department)
                 self.emit_profile(values, url, target["id"], raw)
+            except Cancelled:
+                raise
             except Exception as exc:
+                batch.failed += 1
                 self.ctx.failure(f"教师主页解析失败：{exc}", url)
+        return batch
 
     def emit_profile(self, values, url, unit_id, raw):
         original = Original("page_html", url, f'{values["姓名"]}.html', raw, fetchable=raw is not None)
@@ -475,6 +534,8 @@ class FacultyCollector(BaseCollector):
             if title and re.fullmatch(r"[\u3400-\u9fffA-Za-z·\s（）()]{2,28}", title):
                 name = title
             match = match or RANK.search(name)
+        name = person_name(name)
+        if department:
             name = re.sub(r"\s*(?:文科资深|兼职)?(?:特聘教授|助理教授|副教授|教授|助理研究员|副研究员|研究员)\s*$", "", name)
             name = re.sub(r"\s+", "", name.strip("*＊ ")) if re.search(r"[\u3400-\u9fff]", name) else name
             if len(name) < 2:

@@ -39,6 +39,36 @@ class PhaseTwo(unittest.TestCase):
     def api(self, method, path, **kwargs):
         return self.client.request(method, "/api/" + path, **kwargs)
 
+    def test_web_writes_reject_cross_origin_and_zero_update_ids(self):
+        body = {"values": {"项目名称": "API 核查"}}
+        with self.subTest("cross origin"):
+            self.assertEqual(self.api("POST", "records/projects", json=body,
+                                      headers={"Origin": "https://external.invalid"}).status_code, 403)
+            self.assertEqual(self.api("POST", "records/projects", json=body,
+                                      headers={"Sec-Fetch-Site": "cross-site"}).status_code, 403)
+        self.assertEqual(self.api("PATCH", "records/projects/0", json=body).status_code, 404)
+        self.assertEqual(self.api("PATCH", "units/0", json={"name": "测试学院", "type": "学院"}).status_code, 404)
+        self.assertEqual(self.api("GET", "records/projects").json()["total"], 0)
+        self.assertEqual(self.api("GET", "units").json(), [])
+        self.assertEqual(self.api("POST", "records/projects", json=body,
+                                  headers={"Origin": "http://testserver"}).status_code, 201)
+
+    def test_internal_lookup_error_remains_a_server_error(self):
+        with patch("app.main.list_records", side_effect=KeyError("fixture")):
+            client = TestClient(self.app, raise_server_exceptions=False)
+            self.assertEqual(client.get("/api/records/projects").status_code, 500)
+        self.assertEqual(self.api("GET", "records/unknown").status_code, 404)
+
+    def test_full_jsonl_export_includes_multiple_libraries(self):
+        cases = (("services", "标题", "服务"), ("projects", "项目名称", "项目"))
+        for kind, key, title in cases:
+            self.assertEqual(self.api("POST", f"records/{kind}", json={"values": {key: title}}).status_code, 201)
+        response = self.api("GET", "export/jsonl/all")
+        self.assertEqual(response.status_code, 200)
+        rows = [json.loads(line)["字段"] for line in response.text.splitlines()]
+        self.assertEqual([next(value for value in (row.get("标题"), row.get("项目名称")) if value)
+                          for row in rows], ["服务", "项目"])
+
     def test_attachments_bundle_and_long_field(self):
         source = self.api("POST", "records/policies", json={"values": {"政策名称": "测试政策", "政策摘要": "🀄文本" * 11000}})
         row = source.json()

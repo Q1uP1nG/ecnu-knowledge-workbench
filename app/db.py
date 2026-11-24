@@ -1,7 +1,8 @@
 import hashlib
 import json
 import os
-from contextlib import contextmanager
+import sqlite3
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +20,16 @@ from .patent_identity import patent_key, patent_lookup_keys
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = ROOT / "config" / "sources.yaml"
 metadata = MetaData()
+
+
+def paper_keys_need_cascade(conn):
+    return any(row[2] == "kb_papers" and row[6] != "CASCADE"
+               for row in conn.exec_driver_sql("PRAGMA foreign_key_list(paper_keys)"))
+
+
+def schema_backup_needed(conn):
+    snapshot_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(raw_snapshots)")}
+    return (bool(snapshot_columns) and "request_url" not in snapshot_columns) or paper_keys_need_cascade(conn)
 
 
 def now():
@@ -78,6 +89,7 @@ snapshots = Table("raw_snapshots", metadata,
     Column("id", Integer, primary_key=True),
     Column("source_id", ForeignKey("crawl_sources.id")),
     Column("url", Text, nullable=False),
+    Column("request_url", String),
     Column("request_key", String, nullable=False),
     Column("content_hash", String, nullable=False),
     Column("content_type", String, nullable=False),
@@ -93,7 +105,7 @@ sequences = Table("record_sequences", metadata,
 )
 paper_keys = Table("paper_keys", metadata,
     Column("key", String, primary_key=True),
-    Column("record_id", ForeignKey("kb_papers.id"), nullable=False, index=True),
+    Column("record_id", ForeignKey("kb_papers.id", ondelete="CASCADE"), nullable=False, index=True),
 )
 news_items = Table("park_news_items", metadata,
     Column("url", Text, primary_key=True),
@@ -156,6 +168,7 @@ class Database:
         self.config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
         path = Path(path or os.environ.get("KB_DB_PATH") or ROOT / "data" / "workbench.sqlite3").resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self.attachment_root = path.parent / ("attachments" if path.name == "workbench.sqlite3" else f"{path.stem}-attachments")
         self.engine = create_engine(URL.create("sqlite", database=str(path)), connect_args={"timeout": 30},
                                     json_serializer=lambda obj: json.dumps(obj, ensure_ascii=False))
@@ -167,11 +180,19 @@ class Database:
             conn.execute("PRAGMA journal_mode=WAL")
 
     def initialize(self):
-        with self.write() as conn:
+        with self.write(backup_schema=True) as conn:
             new_patent_index = conn.exec_driver_sql(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='patent_keys'"
             ).scalar_one_or_none() is None
+            rebuild_paper_keys = paper_keys_need_cascade(conn)
             metadata.create_all(conn)
+            if rebuild_paper_keys:
+                conn.exec_driver_sql("CREATE TABLE paper_keys_new (key VARCHAR NOT NULL PRIMARY KEY, "
+                                     "record_id INTEGER NOT NULL REFERENCES kb_papers(id) ON DELETE CASCADE)")
+                conn.exec_driver_sql("INSERT INTO paper_keys_new SELECT key, record_id FROM paper_keys")
+                conn.exec_driver_sql("DROP TABLE paper_keys")
+                conn.exec_driver_sql("ALTER TABLE paper_keys_new RENAME TO paper_keys")
+                conn.exec_driver_sql("CREATE INDEX ix_paper_keys_record_id ON paper_keys (record_id)")
             if new_patent_index:
                 by_number = {}
                 duplicates = set()
@@ -186,7 +207,7 @@ class Database:
                     conn.execute(insert(patent_keys), aliases)
             legacy_paper_links = False
             for table_name, new_column in (("crawl_runs", "cancel_requested_at"), ("crawl_sources", "last_batch_at"),
-                                           ("record_tombstones", "record_key")):
+                                           ("record_tombstones", "record_key"), ("raw_snapshots", "request_url")):
                 existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table_name})")}
                 if new_column not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN {new_column} VARCHAR")
@@ -207,11 +228,40 @@ class Database:
                 stmt = insert(sources).values(id=key, label=config["label"], cron=config["cron"], options={})
                 conn.execute(stmt.on_conflict_do_update(index_elements=["id"], set_={"label": config["label"]}))
 
-    @contextmanager
-    def write(self):
-        with self.engine.connect() as conn:
+    def backup_before_migration(self):
+        folder = self.path.parent / "backups"
+        folder.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%fZ")
+        target = folder / f"before-schema-{self.path.stem}-{stamp}.sqlite3"
+        try:
+            with closing(sqlite3.connect(self.path.as_uri() + "?mode=ro", uri=True)) as source, \
+                 closing(sqlite3.connect(target)) as backup:
+                source.backup(backup)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+
+    def _begin_schema_write(self, conn):
+        for _ in range(3):
+            backed_up_version = None
+            if schema_backup_needed(conn):
+                backed_up_version = conn.exec_driver_sql("PRAGMA data_version").scalar_one()
+                self.backup_before_migration()
             conn.exec_driver_sql("BEGIN IMMEDIATE")
+            if not schema_backup_needed(conn) or backed_up_version == conn.exec_driver_sql("PRAGMA data_version").scalar_one():
+                return
+            # A concurrent commit may have changed the database since the backup.
+            conn.rollback()
+        raise RuntimeError("数据库在备份期间持续有写入，请暂停采集后重试升级")
+
+    @contextmanager
+    def write(self, *, backup_schema=False):
+        with self.engine.connect() as conn:
             try:
+                if backup_schema:
+                    self._begin_schema_write(conn)
+                else:
+                    conn.exec_driver_sql("BEGIN IMMEDIATE")
                 yield conn
                 conn.commit()
             except BaseException:

@@ -299,11 +299,12 @@ def school_coverage_csv(conn, review):
 def school_paper_links_csv(conn, review):
     papers = records["papers"]
     links = school_paper_links(review)
+    active_links = (select(links.c.paper_id, org.c.id.label("unit_id"), org.c.name)
+                    .join(org, (org.c.id == links.c.unit_id) & org.c.archived.is_(False)).subquery())
     statement = (select(papers.c.record_code, papers.c["values"], papers.c.source_url,
-                        papers.c.locked_fields, org.c.id, org.c.name)
-                 .select_from(papers.outerjoin(links, papers.c.id == links.c.paper_id)
-                              .outerjoin(org, (org.c.id == links.c.unit_id) & org.c.archived.is_(False)))
-                 .order_by(papers.c.id, org.c.id))
+                        papers.c.locked_fields, active_links.c.unit_id, active_links.c.name)
+                 .select_from(papers.outerjoin(active_links, papers.c.id == active_links.c.paper_id))
+                 .order_by(papers.c.id, active_links.c.unit_id))
     if review:
         statement = statement.where(papers.c.review_status == review)
     output = BytesIO()
@@ -311,7 +312,7 @@ def school_paper_links_csv(conn, review):
         writer = csv.writer(stream)
         writer.writerow(("成果编号", "论文标题", "院系ID", "院系", "归属依据", "来源URL"))
         for code, values, url, locked, unit_id, name in conn.execute(statement):
-            status = "人工确定" if "@org_unit_id" in locked else "署名单位匹配" if unit_id else "待补充"
+            status = "待补充" if unit_id is None else "人工确定" if "@org_unit_id" in locked else "署名单位匹配"
             writer.writerow([csv_value(value) for value in (code, values.get("论文标题"), unit_id, name, status, url)])
         stream.flush()
         return output.getvalue()

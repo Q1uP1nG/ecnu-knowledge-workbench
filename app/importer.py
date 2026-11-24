@@ -274,7 +274,7 @@ def merge_rows(rows, previous, errors):
     return clean_values(rows[0].kind, values, validate=True)
 
 
-def save_groups(conn, rows, summary, errors, review_status):
+def save_groups(conn, rows, summary, errors, review_status, overwrite_review):
     indexes, groups = group_rows(conn, rows, errors)
     units = defaultdict(list)
     for unit_id, name in conn.execute(select(org.c.id, org.c.name).where(org.c.archived.is_(False))):
@@ -285,18 +285,24 @@ def save_groups(conn, rows, summary, errors, review_status):
         previous = old["values"] if old else {}
         record_id = old["id"] if old else None
         count = len(errors)
-        supplied = {"review_status"}
+        supplied = set()
         unit_id = None
+        paper_units = []
         unit_rows = {name_key(row.unit): row for row in group if row.unit}
-        if len(unit_rows) > 1:
+        if kind != "papers" and len(unit_rows) > 1:
             errors.append(first.issue("同一记录的院系不一致", "院系"))
-        elif unit_rows:
-            unit, row = next(iter(unit_rows.items()))
-            if len(units[unit]) != 1:
-                errors.append(row.issue("院系不存在或有重名，请核对工作台院系名称", "院系"))
-            else:
-                unit_id = units[unit][0]
-                supplied.add("org_unit_ids" if kind == "papers" else "org_unit_id")
+        else:
+            for unit, row in unit_rows.items():
+                if len(units[unit]) != 1:
+                    errors.append(row.issue("院系不存在或有重名，请核对工作台院系名称", "院系"))
+                elif kind == "papers":
+                    if not old or units[unit][0] not in old["org_unit_ids"]:
+                        paper_units.append(units[unit][0])
+                elif not old or old["org_unit_id"] != units[unit][0]:
+                    unit_id = units[unit][0]
+                    supplied.add("org_unit_id")
+            if paper_units:
+                supplied.add("org_unit_ids")
         values = merge_rows(group, previous, errors)
         if len(errors) != count:
             continue
@@ -308,7 +314,8 @@ def save_groups(conn, rows, summary, errors, review_status):
         else:
             key = "import:" + digest([kind, ident])
         body = SimpleNamespace(values=values, expected_updated_at=None, model_fields_set=supplied,
-                               review_status=review_status, org_unit_id=unit_id, org_unit_ids=[unit_id] if unit_id else [])
+                               review_status=review_status if not old or overwrite_review else None,
+                               org_unit_id=unit_id, org_unit_ids=paper_units)
         actions = summary[kind]
         try:
             with conn.begin_nested():
@@ -321,7 +328,7 @@ def save_groups(conn, rows, summary, errors, review_status):
                         conn.execute(insert(patent_keys).values(key=alias, record_id=new["id"]).on_conflict_do_nothing())
                 fields = ("values", "review_status", "locked_fields", "org_unit_id")
                 changed = any(new[field] != old[field] for field in fields) if old else True
-                if old and kind == "papers" and unit_id:
+                if old and paper_units:
                     changed |= set(new["org_unit_ids"]) != set(old["org_unit_ids"])
                 if old and not changed:
                     raise RollbackImport
@@ -337,7 +344,7 @@ def save_groups(conn, rows, summary, errors, review_status):
         actions["will_update" if old else "will_insert"] += 1
 
 
-def import_xlsx(db, stream, *, dry_run=True, review_status="pending"):
+def import_xlsx(db, stream, *, dry_run=True, review_status="pending", overwrite_review=False):
     if review_status not in {"pending", "approved"}:
         raise ValueError("导入审核状态须为待审核或已通过")
     errors = []
@@ -349,7 +356,7 @@ def import_xlsx(db, stream, *, dry_run=True, review_status="pending"):
             raise ValueError("工作簿超过 25 MiB")
         rows = parse_workbook(payload, errors)
         with db.write() as conn:
-            save_groups(conn, rows, summary, errors, review_status)
+            save_groups(conn, rows, summary, errors, review_status, overwrite_review)
             if dry_run or errors:
                 raise RollbackImport
         result["committed"] = True
