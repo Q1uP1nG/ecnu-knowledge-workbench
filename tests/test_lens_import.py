@@ -90,7 +90,7 @@ class LensAndImport(unittest.TestCase):
         with patch.dict("os.environ", {"LENS_API_TOKEN": ""}), patch.object(LensPatentCollector, "fetch") as fetch:
             result = RunManager(self.db).execute(SOURCE_ID, dry_run=True)
             self.assertEqual(result["status"], "failed")
-            self.assertIn("免费学术", result["logs"][-2]["message"])
+            self.assertIn("试用或机构访问", result["logs"][-2]["message"])
             self.assertIn("LENS_API_TOKEN", result["logs"][-2]["message"])
             self.assertIn("LENS_API_TOKEN", RunManager(self.db).execute(SOURCE_ID)["error"])
             fetch.assert_not_called()

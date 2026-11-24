@@ -109,7 +109,9 @@ Web 定时默认关闭。可在 **采集与调度** 开关定时、编辑五段�
 
 ### Lens 授权专利
 
-在 Lens.org 的账户页面申请 Patent API 免费学术访问权限。通过运行工作台或 CLI 的进程环境设置 `LENS_API_TOKEN`。继承此环境的进程可以采集，快照与日志只保存业务信息。默认按华师大中英文申请人名称检索中国授权及 Lens 标识为已授权的 PCT 记录。可在 `config/sources.yaml` 调整 `applicants` 和 `jurisdictions`。批次按公开日期保存进度，专利号与科技处公示共享去重入口。学校定时批次继续运行现有的三个来源，`run-all --scope all` 包含 Lens。[Lens API 入门](https://docs.api.lens.org/getting-started.html) · [专利查询](https://docs.api.lens.org/request-patent.html)
+登录 Lens.org，在 `API & Data` 页面申请 Patent API。个人可申请非商业、有限学术用途试用，获批后有效期为 14 天。长期自动采集需通过机构订阅。获批后在 `Your Active Access` 生成 Token。[Lens Patent API 申请指南](https://support.lens.org/knowledge-base/lens-patent-and-scholar-api/) · [Lens API 使用条款](https://about.lens.org/lens-api-terms-of-use/)
+
+通过运行工作台或 CLI 的进程环境设置 `LENS_API_TOKEN`。继承此环境的进程可以采集，快照与日志只保存业务信息。默认按华师大中英文申请人名称检索中国授权及 Lens 标识为已授权的 PCT 记录。可在 `config/sources.yaml` 调整 `applicants` 和 `jurisdictions`。批次按公开日期保存进度，专利号与科技处公示共享去重入口。学校定时批次继续运行现有的三个来源，`run-all --scope all` 包含 Lens。[Lens API 入门](https://docs.api.lens.org/getting-started.html) · [专利查询](https://docs.api.lens.org/request-patent.html)
 
 ```powershell
 $token = Read-Host 'Lens Patent API Token' -AsSecureString

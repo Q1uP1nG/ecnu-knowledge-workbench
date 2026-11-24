@@ -11,7 +11,10 @@ from .base import BaseCollector, FetchError, clean
 from .transfer import patent_affiliation, person_names
 
 SOURCE_ID = "ecnu_lens_patents"
-MISSING_TOKEN = "未设置 LENS_API_TOKEN。请到 lens.org 申请 Patent API 免费学术访问权限，将 Token 设置为环境变量 LENS_API_TOKEN。"
+MISSING_TOKEN = (
+    "未设置 LENS_API_TOKEN。请登录 Lens.org，在 API & Data 申请 Patent API 试用或机构访问。"
+    "获批后生成 Token 并设置环境变量 LENS_API_TOKEN。"
+)
 GRANTED = ("GRANTED_PATENT", "AMENDED_PATENT", "LIMITED_PATENT", "DESIGN_RIGHT", "PLANT_PATENT")
 STATUSES = dict.fromkeys(("ACTIVE", "PATENTED", "GRANTED"), "授权") | dict.fromkeys(
     ("EXPIRED", "DISCONTINUED", "REVOKED", "INVALID", "INACTIVE"), "无效")
