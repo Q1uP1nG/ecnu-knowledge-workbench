@@ -126,6 +126,8 @@ def upsert_entry(conn, source_id, entry, *, return_id=False):
         previous = found["values"] if found else {}
         values["上传时间"] = previous.get("上传时间") or (found["created_at"][:10] if found else local_date())
     source_url, org_id, evidence_date = entry.url, entry.org_id, entry.evidence_date
+    if found and entry.kind in {"patents", "projects"} and source_id in {"ecnu_kjc_transfer", "ecnu_lens_patents"} and org_id is None:
+        org_id = found["org_unit_id"]
     if entry.kind == "patents" and found:
         previous = found["values"]
         same_source = source_id == found["source_id"]

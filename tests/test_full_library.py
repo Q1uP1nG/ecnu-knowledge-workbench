@@ -20,17 +20,19 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, insert, select, update
 
 import cli
-from app.attachments import LinkOnly, Original, clean_filename, fetch_original
+from app.attachments import LinkOnly, Original, clean_filename, fetch_original, register_original
 from app.collectors import COLLECTORS
-from app.collectors.faculty import FacultyCollector, ProfileBatch, profile_key, research_keywords
+from app.collectors.faculty import FacultyCollector, ProfileBatch, person_name, profile_key, research_keywords, same_profile
 from app.collectors.openalex import OpenAlexCollector
 from app.collectors.park import ScienceParkCollector
 from app.collectors.policies import PolicyCollector
-from app.collectors.transfer import TransferCollector, person_names
-from app.db import Database, ROOT, digest, now, org, paper_keys, records, runs, snapshots, sources
+from app.collectors.transfer import TransferCollector, patent_affiliation, person_names
+from app.db import Database, ROOT, attachments, digest, now, org, paper_keys, records, runs, snapshots, sources, tombstones
 from app.errors import Cancelled
 from app.export import school_coverage_csv, school_paper_links_csv
+from app.faculty_merge import merge_faculty
 from app.main import create_app
+from app.maintenance import cleanup
 from app.runner import RunContext, RunManager
 from app.store import Conflict, Entry, Unit, delete_record, sync_units, units, upsert_entry
 
@@ -74,7 +76,7 @@ class FullLibrary(unittest.TestCase):
         self.db.initialize()
 
     def collector(self, cls, source):
-        return cls(SimpleNamespace(db=self.db, config=self.db.config["sources"][source], options={}))
+        return cls(SimpleNamespace(db=self.db, source_id=source, config=self.db.config["sources"][source], options={}))
 
     def cli(self, *args):
         result = subprocess.run(
@@ -150,6 +152,77 @@ class FullLibrary(unittest.TestCase):
         biography = BeautifulSoup('<main><p>王一，测试学院讲师，曾任另一所大学青年研究员。</p>'
                                   '<h3>社会兼职</h3>研究院特聘教授</main>', "lxml")
         self.assertEqual(collector.profile_values(biography, {"title": "王一"}, "测试学院")["职称"], "讲师")
+
+    def test_faculty_person_name_handles_aliases_and_preserves_latin_name(self):
+        samples = {
+            "戴跃，Yue Dai": "戴跃", "戴跃, Yue Dai": "戴跃", "朱彦 / Yan Zhu": "朱彦",
+            "李珂（李依宸）": "李珂", "PaulJ.D’Ambrosio(德安博)": "PaulJ.D’Ambrosio",
+            "D’Ambrosio, Paul J.": "D’Ambrosio, Paul J.", "María García-López": "María García-López",
+        }
+        for raw, expected in samples.items():
+            self.assertEqual(person_name(raw), expected)
+
+    def test_faculty_duplicate_alias_requires_identity_evidence(self):
+        sync_units(self.db, [Unit("a", "甲院", "学院")])
+        unit, = units(self.db)
+        url = "https://faculty.ecnu.edu.cn/teacher"
+        alias = "https://faculty.ecnu.edu.cn/another"
+        values = {"姓名": "王一", "联系邮箱": "one@example.org"}
+        with self.db.write() as conn:
+            upsert_entry(conn, FACULTY, Entry("faculty", url, values, url, org_id=unit["id"]))
+        collector = self.collector(FacultyCollector, FACULTY)
+        collector.ctx.emit = Mock()
+        collector.emit_profile(values, alias, unit["id"], b"<main>Teacher</main>")
+        emitted = collector.ctx.emit.call_args.args[0]
+        self.assertEqual(emitted.key, url)
+        self.assertEqual(emitted.attachments[0].url, alias)
+        collector.emit_profile({"姓名": "王一"}, alias, unit["id"], b"<main>Another teacher</main>")
+        self.assertEqual(collector.ctx.emit.call_args.args[0].key, alias)
+
+    def test_faculty_merge_moves_originals_preserves_locks_and_blocks_alias(self):
+        sync_units(self.db, [Unit("a", "甲院", "学院")])
+        unit, = units(self.db)
+        table = records["faculty"]
+        first = "https://faculty.ecnu.edu.cn/teacher"
+        alias = "https://faculty.ecnu.edu.cn/old-alias"
+        with self.db.write() as conn:
+            _, keep = upsert_entry(conn, FACULTY, Entry("faculty", first, {"姓名": "王一", "备注": "人工"}, first,
+                                                       org_id=unit["id"]), return_id=True)
+            _, drop = upsert_entry(conn, FACULTY, Entry("faculty", alias, {"姓名": "王一", "职称": "教授"}, alias,
+                                                       org_id=unit["id"]), return_id=True)
+            conn.execute(update(table).where(table.c.id == keep).values(locked_fields=["备注"], is_manual_locked=True))
+            conn.execute(insert(attachments).values(kind="faculty", record_id=drop, identity="old",
+                         role="page_html", filename="old.html", fetch_status="link_only", source_url=alias))
+        preview = merge_faculty(self.db, [(keep, drop)], dry_run=True)
+        self.assertEqual(preview["groups"][0]["kept"], keep)
+        with self.db.engine.connect() as conn:
+            self.assertIsNotNone(conn.scalar(select(table.c.id).where(table.c.id == drop)))
+        merge_faculty(self.db, [(keep, drop)])
+        with self.db.write() as conn:
+            row = conn.execute(select(table)).mappings().one()
+            self.assertEqual((row["id"], row["values"]["备注"], row["values"]["职称"], row["locked_fields"]),
+                             (keep, "人工", "教授", ["备注"]))
+            self.assertEqual(conn.scalar(select(attachments.c.record_id)), keep)
+            self.assertEqual(conn.scalar(select(tombstones.c.key)), alias)
+            self.assertEqual(upsert_entry(conn, FACULTY, Entry("faculty", alias, {"姓名":"王一"}, alias,
+                                                               org_id=unit["id"])), "skipped")
+
+    def test_faculty_merge_rolls_back_if_manual_fields_conflict(self):
+        sync_units(self.db, [Unit("a", "甲院", "学院")])
+        unit, = units(self.db)
+        table = records["faculty"]
+        with self.db.write() as conn:
+            ids = []
+            for key in ("first", "second"):
+                _, record_id = upsert_entry(conn, FACULTY, Entry("faculty", key, {"姓名": "王一", "备注": key},
+                                                            "", org_id=unit["id"]), return_id=True)
+                ids.append(record_id)
+            conn.execute(update(table).values(locked_fields=["备注"], is_manual_locked=True))
+        with self.assertRaises(Conflict):
+            merge_faculty(self.db, [ids])
+        with self.db.engine.connect() as conn:
+            self.assertEqual(list(conn.scalars(select(table.c.id).order_by(table.c.id))), ids)
+            self.assertIsNone(conn.scalar(select(tombstones.c.key)))
 
     def test_faculty_auth_redirect_keeps_public_roster_without_archiving_login(self):
         collector = self.collector(FacultyCollector, FACULTY)
@@ -435,6 +508,28 @@ class FullLibrary(unittest.TestCase):
             self.assertEqual(conn.scalar(select(records["patents"].c.record_code)), "P001")
             self.assertEqual(conn.scalar(select(records["projects"].c.record_code)), "J001")
 
+    def test_affiliation_votes_ignore_administration_and_keep_genuine_ties(self):
+        sync_units(self.db, [Unit("a", "精密光谱研究院", "研究机构"), Unit("b", "生命科学学院", "学院"),
+                             Unit("x", "机关党委", "直属单位")])
+        by_name={u["name"]:u["id"] for u in units(self.db)}
+        a, b, x = (by_name[name] for name in ("精密光谱研究院", "生命科学学院", "机关党委"))
+        members = [("行政甲",x), ("共同名",a), ("共同名",b), ("方向甲",a), ("方向乙",a), ("方向丙",b)]
+        with self.db.write() as conn:
+            for i,(name,unit) in enumerate(members):
+                upsert_entry(conn,FACULTY,Entry("faculty",f"teacher:{i}",{"姓名":name},"",org_id=unit))
+        self.assertEqual(patent_affiliation(self.db,"","行政甲、方向甲、方向乙、方向丙"),a)
+        self.assertIsNone(patent_affiliation(self.db,"","方向甲、方向丙"))
+        self.assertIsNone(patent_affiliation(self.db,"","共同名"))
+        self.assertEqual(patent_affiliation(self.db,"","共同名",fallback="方向甲"),a)
+        self.assertEqual(patent_affiliation(self.db,"","行政甲"),x)
+        self.assertEqual(patent_affiliation(self.db,"生命科学学院","方向甲"),b)
+        with self.db.write() as conn:
+            for kind, field in (("patents","专利名称"),("projects","项目名称")):
+                previous = Entry(kind,"test",{field:"示例"},"",org_id=b)
+                upsert_entry(conn,TRANSFER,previous)
+                upsert_entry(conn,TRANSFER,Entry(kind,"test",{field:"更新"},""))
+                self.assertEqual(conn.scalar(select(records[kind].c.org_unit_id)),b)
+
     def test_transfer_person_link_rejects_ambiguous_name(self):
         sync_units(self.db, [Unit("school", "测试大学", "学校"),
                              Unit("a", "学院甲", "学院", "school"), Unit("b", "学院乙", "学院", "school")])
@@ -462,6 +557,73 @@ class FullLibrary(unittest.TestCase):
         with self.db.write() as conn:
             self.assertEqual(upsert_entry(conn, POLICY, row), "inserted")
             self.assertEqual(upsert_entry(conn, POLICY, row), "skipped")
+
+    def test_policy_outline_is_body_evidence_and_not_source_url(self):
+        collector = self.collector(PolicyCollector, POLICY)
+        url = "https://kjy.ecnu.edu.cn/example/page.htm"
+        header = '<meta charset="utf-8"><h1 class="title-info">测试通知</h1>'
+        intro = "按照相关工作总体部署安排，现将本年度的申请工作有关事项告知如下。"
+        plain = f'{header}<article class="wp_articlecontent"><p>{intro}</p></article>'
+        entry, = collector.entries(url, plain.encode(), "2026-04-01")
+        self.assertIsNone(entry.values["原文目录"])
+        self.assertEqual(entry.url, url)
+        section = "<p><strong>扶持范围</strong></p><p>在本区注册且符合科技创新要求的成长型企业均可申报本项目。</p>"
+        structured = plain.replace("</article>", section + "</article>")
+        entry, = collector.entries(url, structured.encode(), "2026-04-01")
+        self.assertEqual(entry.values["原文目录"], "扶持范围")
+        self.assertIn("在本区注册", entry.values["政策摘要"])
+
+    def test_service_table_label_starts_real_chapter(self):
+        collector = self.collector(ScienceParkCollector, PARK)
+        collector.ctx.emit = Mock()
+        url = "https://kjy.ecnu.edu.cn/example/page.htm"
+        soup = BeautifulSoup("""
+            <title>创业见习</title><article class="wp_articlecontent">
+            <p>这里是园区的见习介绍。</p>
+            <table><tr><td colspan="4">创业见习岗位</td></tr>
+            <tr><td>岗位名称</td><td>创业助理</td></tr></table>
+            </article>""", "lxml")
+        collector.service(url, "创业服务", soup)
+        entry = collector.ctx.emit.call_args.args[0]
+        self.assertEqual(entry.values["章节数"], 2)
+        self.assertEqual(entry.values["章节"][1]["章节标题"], "创业见习岗位")
+        self.assertIn("创业助理", entry.values["章节"][1]["章节原文"])
+        self.assertEqual(entry.values["上传人"], "公开来源采集")
+
+    def test_paper_filename_requires_pdf_archive_and_preserves_locks(self):
+        table = records["papers"]
+        field = "原始文件名"
+        context = SimpleNamespace(active=Mock(), log=Mock(), options={"download_attachments": False})
+        link = Original("source_pdf", "https://arxiv.org/pdf/1234", "work.pdf")
+        with self.db.write() as conn:
+            _, saved_id = upsert_entry(conn, PAPERS, Entry("papers", "saved", {"论文标题": "Saved"}, ""), return_id=True)
+            _, locked_id = upsert_entry(conn, PAPERS, Entry("papers", "locked", {"论文标题": "Locked"}, ""), return_id=True)
+            conn.execute(update(table).where(table.c.id == locked_id).values(locked_fields=[field]))
+        register_original(self.db, "papers", saved_id, link, context)
+        with self.db.engine.connect() as conn:
+            self.assertIsNone(conn.scalar(select(table.c["values"]).where(table.c.id == saved_id)).get(field))
+        context.options["download_attachments"] = True
+        with patch("app.attachments.fetch_original", return_value=({"mime_type": "application/pdf"}, "work.pdf")):
+            for record_id in (saved_id, locked_id):
+                register_original(self.db, "papers", record_id, link, context)
+        with self.db.engine.connect() as conn:
+            values = dict(conn.execute(select(table.c.id, table.c["values"])).all())
+            self.assertEqual(values[saved_id][field], "work.pdf")
+            self.assertIsNone(values[locked_id].get(field))
+
+    def test_faculty_research_keeps_source_paragraphs_and_punctuation(self):
+        collector = self.collector(FacultyCollector, FACULTY)
+        soup = BeautifulSoup("""
+            <main><h3>研究方向</h3><div>
+            <p>超冷原子气体的理论研究；重点关注少体物理。</p>
+            <p>研究强关联量子气体及其远离平衡的动力学。</p>
+            </div><h3>代表性成果</h3><p>Selected paper, 2025.</p></main>
+        """, "lxml")
+        values = collector.profile_values(soup, {"title": "测试教师"}, "物理学院")
+        expected = "超冷原子气体的理论研究；重点关注少体物理。\n研究强关联量子气体及其远离平衡的动力学。"
+        self.assertEqual(values["研究方向详述"], expected)
+        self.assertEqual(values["代表性成果"], "Selected paper, 2025.")
+        self.assertTrue(same_profile({"研究方向详述": expected.replace("\n", "；")}, values))
 
     def test_keyword_and_company_intro_cleaning(self):
         text = "依托华东师范大学集成电路学院团队，近年来的研究兴趣主要涉及大模型隐私安全）；" \
@@ -640,6 +802,44 @@ class FullLibrary(unittest.TestCase):
         copy = max((self.path.parent / "backups").glob("before-schema-*.sqlite3"))
         with closing(sqlite3.connect(copy)) as original:
             self.assertEqual(original.execute("SELECT count(*) FROM raw_snapshots").fetchone()[0], 1)
+
+    def test_cleanup_keeps_latest_success_and_deletes_only_unreferenced_blobs(self):
+        with self.db.write() as conn:
+            for i,status in enumerate((200,200,503,503),1):
+                stamp=f"2026-11-25T00:00:0{i}+00:00"
+                conn.execute(insert(snapshots).values(source_id=FACULTY,url="https://faculty.ecnu.edu.cn/fixture",
+                    request_key="same",content_hash=str(i),content_gzip=b"x"*i,content_type="text/html",
+                    http_status=status,fetched_at=stamp,last_seen_at=stamp))
+            conn.execute(insert(attachments).values(kind="faculty",record_id=1,identity="existing",role="page_html",
+                         filename="keep.html",fetch_status="downloaded",relative_path="blobs/aa/"+("a"*64)))
+        blobs=self.db.attachment_root/"blobs"
+        keep=blobs/"aa"/("a"*64)
+        orphan=blobs/"bb"/("b"*64)
+        other=blobs/"bb"/"foreign-file"
+        for path in (keep,orphan,other):
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_bytes(b"example")
+        preview=cleanup(self.db,dry_run=True)
+        self.assertEqual((preview["snapshot_count"],preview["snapshot_gzip_bytes"],preview["orphan_count"]),(3,8,1))
+        self.assertTrue(orphan.is_file())
+        result=cleanup(self.db,keep_snapshots=2,vacuum=True)
+        self.assertEqual(result["orphan_bytes"],7)
+        self.assertFalse(orphan.exists())
+        self.assertTrue(keep.is_file() and other.is_file())
+        with self.db.engine.connect() as conn:
+            self.assertEqual(list(conn.scalars(select(snapshots.c.content_hash).order_by(snapshots.c.id))),["2","4"])
+            self.assertEqual(conn.exec_driver_sql("PRAGMA integrity_check").scalar(),"ok")
+
+    def test_cleanup_defers_file_removal_while_collection_is_running(self):
+        RunManager(self.db).claim(FACULTY, "incremental", "test")
+        digest = "b" * 64
+        orphan = self.db.attachment_root / "blobs" / "bb" / digest
+        orphan.parent.mkdir(parents=True)
+        orphan.write_bytes(b"example")
+        self.assertEqual(cleanup(self.db, dry_run=True)["orphan_count"], 1)
+        with self.assertRaises(Conflict):
+            cleanup(self.db)
+        self.assertTrue(orphan.is_file())
 
     def test_openalex_old_order_starts_new_window(self):
         prior = {"publication": {"inflight": {

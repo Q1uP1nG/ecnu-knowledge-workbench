@@ -123,12 +123,20 @@ class ScienceParkCollector(BaseCollector):
         originals = []
         if raw:
             originals.append(Original("page_html", url, f"{title}.html", raw))
+
         def finish():
             if chapter:
                 trail = " / ".join(parents[i] for i in sorted(parents) if i < level)
                 sections.append({"章节名称": f"{trail} / {heading}" if trail else heading,
                                  "章节标题": heading, "章节分类": category, "章节原文": "\n".join(chapter)})
                 chapter.clear()
+
+        def start_section(label, depth):
+            nonlocal heading, level, parents
+            finish()
+            heading, level = label, depth
+            parents = {i: name for i, name in parents.items() if i < level}
+            parents[level] = heading
 
         for node in article.select("h1,h2,h3,h4,h5,h6,p,li,table,img,a[href]"):
             if node.find_parent(["table", "li"]) and node.name != "img":
@@ -151,15 +159,20 @@ class ScienceParkCollector(BaseCollector):
                 line = text_of(node)
                 if not line:
                     continue
+                if node.name == "table":
+                    first_row = node.find("tr")
+                    cells = first_row.find_all(["td", "th"], recursive=False) if first_row else []
+                    label = text_of(node.find("caption", recursive=False))
+                    if not label and len(cells) == 1 and re.fullmatch(r"[2-9]\d*", cells[0].get("colspan", "")):
+                        label = text_of(cells[0])
+                    if 2 <= len(label) <= 36 and label != heading:
+                        start_section(label, 2)
                 is_heading = 2 <= len(line) <= 36 and not line.startswith(("（", "(")) and not line.endswith("。") and (
                     id(node) in headings or node.name == "p" and (
                         NUMBERED.match(line) or node.find(["strong", "b"]) and text_of(node.find(["strong", "b"])) == line))
                 if is_heading:
-                    finish()
-                    heading = line
-                    level = int(node.name[1]) if re.fullmatch("h[1-6]", node.name) else 2
-                    parents = {i: label for i, label in parents.items() if i < level}
-                    parents[level] = line
+                    depth = int(node.name[1]) if re.fullmatch("h[1-6]", node.name) else 2
+                    start_section(line, depth)
                     body.append(line)
                     continue
             if not body or body[-1] != line:
@@ -177,6 +190,7 @@ class ScienceParkCollector(BaseCollector):
         self.ctx.emit(Entry("services", url, {
             "标题": title, "分类": category, "来源": "华东师范大学国家大学科技园",
             "文件名": f"{title}.html", "文件格式": "HTML",
+            "上传人": "公开来源采集",
             "说明": info, "文档正文": "\n\n".join(body), "章节数": len(sections), "章节": sections,
         }, url, attachments=tuple(dict.fromkeys(originals))))
 

@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 from sqlalchemy import func, select
 
 from ..attachments import Original
-from ..db import now, org, records, snapshots
+from ..db import now, org, records, snapshots, tombstones
 from ..errors import Cancelled
 from ..store import Entry, Unit, descendants, sync_units, units
 from .base import BaseCollector, clean, link, preferred, text_of
@@ -26,6 +26,8 @@ RANK_LEVELS = (
 )
 RANK_WEIGHT = {rank: level for level, ranks in enumerate(RANK_LEVELS) for rank in ranks}
 RANK = re.compile("|".join(sorted(RANK_WEIGHT, key=len, reverse=True)))
+CHINESE_NAME = r"[\u3400-\u9fff·]{2,8}"
+LATIN_NAME = r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ .’'\-]*"
 RANK_LABEL = re.compile(r"^(?:专业技术职务|职称)\s*[：:]\s*")
 OTHER_ROLES = re.compile(r"社会兼职|学术兼职|科研项目|代表性成果|学术成果|荣誉及奖励")
 INCIDENTAL_RANK = re.compile(
@@ -35,7 +37,7 @@ EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", re.ASCII)
 RESEARCH = re.compile(r"研究方向|研究领域|研究兴趣|Research (?:Interests?|Areas?)", re.I)
 RESULTS = re.compile(r"代表性成果|代表性论文|代表论文|代表著作|科研成果|学术成果|Selected Publications", re.I)
 KEYWORD_LEAD = re.compile(
-    r"^(?:近年来(?:的)?研究兴趣主要涉及|研究兴趣主要涉及|目前主要研究|主要从事|主要研究|"
+    r"^(?:近年来(?:的)?研究兴趣主要涉及|研究兴趣主要涉及|目前主要研究|一直致力于|主要从事|主要研究|"
     r"具体方向涉及|重点关注|依托[^，,；;。]{0,35}?团队|(?:主要)?(?:研究方向|研究兴趣|研究领域))\s*(?:[：:]|为|包括)?\s*"
 )
 
@@ -77,8 +79,21 @@ def norm(name):
 
 def person_name(value):
     name = clean(value)
-    name = re.sub(r"^([\u3400-\u9fff·]{2,8})\s*[（(][A-Za-z][A-Za-z .'-]*[）)]$", r"\1", name)
-    return re.sub(rf"^([\u3400-\u9fff·]{{2,8}})[\s,，、]+(?:博士生导师|硕士生导师|{RANK.pattern}).*$", r"\1", name)
+    match = re.fullmatch(
+        rf"({CHINESE_NAME})\s*(?:[（(]\s*(?:{CHINESE_NAME}|{LATIN_NAME})\s*[）)]|[,，/／]\s*{LATIN_NAME})", name)
+    if not match:
+        match = re.fullmatch(rf"({LATIN_NAME})\s*[（(]\s*{CHINESE_NAME}\s*[）)]", name)
+    return match[1].strip() if match else re.sub(
+        rf"^({CHINESE_NAME})[\s,，、]+(?:博士生导师|硕士生导师|{RANK.pattern}).*$", r"\1", name)
+
+
+def same_profile(candidate, incoming):
+    email = clean(incoming.get("联系邮箱")).casefold()
+    if email and email == clean(candidate.get("联系邮箱")).casefold():
+        return True
+    research = clean("；".join((incoming.get("研究方向详述") or "").splitlines()))
+    previous = clean("；".join((candidate.get("研究方向详述") or "").splitlines()))
+    return len(research) >= 28 and research == previous
 
 
 def profile_rank(body, name):
@@ -330,9 +345,10 @@ class FacultyCollector(BaseCollector):
             try:
                 values = self.profile_values(BeautifulSoup(raw, "lxml"), {
                     "title": old.get("姓名"), "career": careers.get(profile_key(url))}, old.get("所属学院/系"))
-                if not values["职称"]:
-                    values["职称"] = old.get("职称")
-                self.emit_profile(values, url, row["org_unit_id"], raw)
+                for field in values:
+                    if not values[field] and old.get(field):
+                        values[field] = old[field]
+                self.emit_profile(values, url, row["org_unit_id"], raw, match_alias=False)
                 parsed += 1
             except Cancelled:
                 raise
@@ -519,9 +535,23 @@ class FacultyCollector(BaseCollector):
                 self.ctx.failure(f"教师主页解析失败：{exc}", url)
         return batch
 
-    def emit_profile(self, values, url, unit_id, raw):
+    def emit_profile(self, values, url, unit_id, raw, *, match_alias=True):
+        key, primary_url = profile_key(url), url
+        if match_alias and unit_id and raw:
+            table = records["faculty"]
+            with self.ctx.db.engine.connect() as conn:
+                known = conn.scalar(select(table.c.id).where(table.c.unique_key == key))
+                blocked = conn.scalar(select(tombstones.c.key).where(tombstones.c.kind == "faculty", tombstones.c.key == key))
+                if not known and not blocked:
+                    candidates = [row for row in conn.execute(select(table.c.unique_key, table.c.source_url, table.c["values"]).where(
+                        table.c.org_unit_id == unit_id, table.c.source_id == self.ctx.source_id,
+                        table.c["values"]["姓名"].as_string() == values["姓名"]))
+                        if same_profile(row[2], values)]
+                    if len(candidates) == 1:
+                        key, primary_url, existing = candidates[0]
+                        values = {**values, **{field: value for field, value in existing.items() if value}}
         original = Original("page_html", url, f'{values["姓名"]}.html', raw, fetchable=raw is not None)
-        self.ctx.emit(Entry("faculty", profile_key(url), values, url, org_id=unit_id, attachments=(original,)))
+        self.ctx.emit(Entry("faculty", key, values, primary_url, org_id=unit_id, attachments=(original,)))
 
     def profile_values(self, soup, row, unit_name, department=False):
         body = preferred(soup, self.selectors["profile"]) or soup
@@ -570,7 +600,7 @@ class FacultyCollector(BaseCollector):
                 if adjacent and len(text_of(adjacent)) > len(label):
                     parts = [text_of(p) for p in adjacent.select("li, p") or [adjacent] if text_of(p)]
             if parts and RESEARCH.search(label) and not research:
-                research = "；".join(parts)
+                research = "\n".join(parts)
             if parts and RESULTS.search(label) and not results:
                 entries = [part for part in dict.fromkeys(parts) if not re.fullmatch(r"[\u3400-\u9fff]{2,12}[：:]?", part)]
                 results = "\n".join(part[:500] for part in entries[:3])

@@ -128,6 +128,11 @@ def save_excel(conn, review, target, strict=False, *, kinds_filter=None, templat
                     for entry in horizontal_rows(kind, row["values"]):
                         write_row(sheet, row_index, [export_cell(entry.get(field), strict, affected, (kind, row["id"]))
                                                     for field in fields])
+                        url = row["source_url"] or ""
+                        if kind == "policies" and url.startswith(("https://", "http://")):
+                            cell = sheet.cell(row_index, fields.index("来源") + 1)
+                            if cell.value:
+                                cell.hyperlink = url
                         row_index += 1
             for i, field in enumerate(fields, 1):
                 width = 42 if field in {"文档正文", "章节原文", "摘要", "技术摘要", "需求详情"} else max(16, len(field) * 2 + 3)

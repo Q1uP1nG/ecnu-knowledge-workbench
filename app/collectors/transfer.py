@@ -1,13 +1,14 @@
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..db import org, records
 from ..patent_identity import patent_key
 from ..store import Entry
 from .base import clean, text_of
+from .faculty import person_name
 from .notices import NoticeCollector, article_lines
 
 NUMBER = re.compile(r"(?i)(?<![A-Z0-9])(?:(?:ZL|CN)\s*)?(?:\d{12}\s*\.\s*[\dX]|\d{8}\s*\.\s*[\dX]|\d{12})(?![\d.])")
@@ -119,23 +120,35 @@ def person_names(*values):
 
 def patent_affiliation(db, text, people, *, fallback=""):
     faculty = records["faculty"]
+    names = tuple(dict.fromkeys(person_name(name).casefold() for name in person_names(people, fallback)))
+    academic = {"学院", "系", "学部", "书院", "研究机构"}
     with db.engine.connect() as conn:
-        units = {name: unit_id for unit_id, name in conn.execute(
-            select(org.c.id, org.c.name).where(org.c.archived.is_(False)))}
-        mentioned = {name for name in units if name != "华东师范大学" and name in text}
+        units = {unit_id: (name, kind) for unit_id, name, kind in conn.execute(
+            select(org.c.id, org.c.name, org.c.type).where(org.c.archived.is_(False), org.c.type != "学校"))}
+        mentioned = {name for name, _ in units.values() if name in (text or "")}
         specific = {name for name in mentioned if not any(name != other and name in other for other in mentioned)}
-        if specific:
-            return units[next(iter(specific))] if len(specific) == 1 else None
-        names = set(person_names(people))
-        alternate_names = set(person_names(fallback))
-        column = faculty.c["values"]["姓名"].as_string()
-        matches = defaultdict(list)
-        for name, unit_id in conn.execute(select(column, faculty.c.org_unit_id).where(column.in_(names | alternate_names))):
-            matches[name].append(unit_id)
-    unique = {ids[0] for name in names if len(ids := matches[name]) == 1 and ids[0] in units.values()}
-    if not unique:
-        unique = {ids[0] for name in alternate_names if len(ids := matches[name]) == 1 and ids[0] in units.values()}
-    return next(iter(unique)) if len(unique) == 1 else None
+        explicit = [unit_id for unit_id, (name, _) in units.items() if name in specific]
+        if len(explicit) == 1:
+            return explicit[0]
+        if not names:
+            return None
+        column = func.lower(faculty.c["values"]["姓名"].as_string())
+        matches = defaultdict(set)
+        for name, unit_id in conn.execute(select(column, faculty.c.org_unit_id).where(
+                column.in_(names), faculty.c.org_unit_id.in_(units))):
+            matches[name].add(unit_id)
+    academic_hits = {unit_id for hits in matches.values() for unit_id in hits if units[unit_id][1] in academic}
+    scores = Counter()
+    for index, name in enumerate(names):
+        candidates = matches[name] & academic_hits if academic_hits else matches[name]
+        if len(candidates) == 1:
+            scores[next(iter(candidates))] += 3 + (index == 0)
+        else:
+            scores.update(candidates)
+    ranking = scores.most_common(2)
+    if ranking and (len(ranking) == 1 or ranking[0][1] - ranking[1][1] >= 2):
+        return ranking[0][0]
+    return None
 
 
 class TransferCollector(NoticeCollector):

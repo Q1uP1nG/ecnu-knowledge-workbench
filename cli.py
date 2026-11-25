@@ -5,13 +5,22 @@ import sys
 from app.collectors import COLLECTORS
 from app.db import Database
 from app.demo import seed
+from app.faculty_merge import merge_faculty
 from app.importer import import_xlsx
+from app.maintenance import cleanup
 from app.runner import OPTIONS, STATUS_KEYS, RunManager, options_for
 from app.schema import SPECS
 from app.store import Conflict, list_tombstones, restore_tombstone
 
 
 SCHOOL_SOURCES = ("ecnu_faculty", "ecnu_openalex_papers", "ecnu_kjc_transfer")
+
+
+def faculty_group(value):
+    try:
+        return tuple(int(item) for item in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("请用逗号分隔师资 ID，例如 123,456") from None
 
 
 def parser():
@@ -25,6 +34,13 @@ def parser():
     restore = tombstone_commands.add_parser("restore")
     restore.add_argument("--kind", choices=tuple(SPECS), required=True)
     restore.add_argument("--key", required=True)
+    merge = commands.add_parser("faculty-merge", help="合并已确认同人的同院系师资")
+    merge.add_argument("--group", type=faculty_group, action="append", required=True, metavar="ID,ID")
+    merge.add_argument("--dry-run", action="store_true", help="预览主记录与附件迁移")
+    maintain = commands.add_parser("cleanup", help="裁剪旧快照并清理无引用的附件")
+    maintain.add_argument("--keep-snapshots", type=int, default=1, metavar="N")
+    maintain.add_argument("--dry-run", action="store_true", help="仅统计待裁剪快照和孤儿文件")
+    maintain.add_argument("--vacuum", action="store_true", help="清理后压缩 SQLite 文件")
     run = commands.add_parser("run", help="执行一次采集")
     run.add_argument("--source", choices=tuple(COLLECTORS), required=True)
     run.add_argument("--mode", choices=("incremental", "full"), default="incremental")
@@ -81,6 +97,10 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     args = parser().parse_args()
     def execute(db):
+        if args.command == "faculty-merge":
+            return merge_faculty(db, args.group, dry_run=args.dry_run)
+        if args.command == "cleanup":
+            return cleanup(db, keep_snapshots=args.keep_snapshots, dry_run=args.dry_run, vacuum=args.vacuum)
         db.initialize()
         if args.command == "seed":
             return seed(db)

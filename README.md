@@ -153,6 +153,10 @@ Excel 会截断超过单元格字符上限的内容，提示受影响记录数�
 
 编辑已有记录后可在「关联原件」区上传或预览文件。上传论文、专利和政策原件会回填文件名称。原件单文件上限为 50 MiB。自动下载限公开链接及配置中的域名，其他链接和获取失败状态会出现在清单中。默认数据库的文件保存在 `data/attachments`，做完整备份时同时备份数据库和原件目录。
 
+维护前先备份 SQLite 工作库。已经核对为同一人的教师可用 `python cli.py faculty-merge --group ID,ID --dry-run` 预览主记录、旧主页和原件迁移。确认后去掉 `--dry-run` 执行，可用多个 `--group` 一次合并。
+
+使用 `python cli.py cleanup --dry-run` 预检旧快照和孤儿原件。默认保留每个请求最后一次成功的快照，只有失败响应的请求保留最新一份。可用 `--keep-snapshots 2` 多留一个版本。采集结束后可运行 `python cli.py cleanup --vacuum` 执行清理和 SQLite 压缩。
+
 自动下载默认只连接公网地址。如果校内 DNS 或 VPN 将已允许的附件域名解析为私网地址，可在 `config/sources.yaml` 的 `attachments.private_host_networks` 中添加精确域名和由校方确认的 CIDR 列表。单个地址用 IPv4 `/32` 或 IPv6 `/128`。例外仅允许 RFC 1918 或 IPv6 ULA 网段，每次重定向仍独立校验域名、地址和 HTTPS 证书。
 
 中文搜索目前按包含关系匹配。数据量增大后可基于实际查询耗时评估 FTS5 trigram 索引，迁移时需保留一到两个汉字的检索行为。

@@ -228,7 +228,7 @@ sources:
     mailto: ""
     overlap_days: 90
     options:
-      max_papers: 30
+      max_papers: 0
       publication_year: null
       from_updated_date: null
       sync_strategy: publication

@@ -61,6 +61,23 @@ def original_path(db, relative):
     return path if path.is_relative_to(root) and path.is_file() else None
 
 
+def fill_paper_pdf_name(conn, record_id, filename):
+    if not filename or not filename.lower().endswith(".pdf"):
+        return False
+    table = records["papers"]
+    row = conn.execute(select(table.c["values"], table.c.locked_fields)
+                       .where(table.c.id == record_id)).one_or_none()
+    if row is None:
+        return False
+    values, locked = row
+    field = "原始文件名"
+    if values.get(field) or field in locked:
+        return False
+    conn.execute(update(table).where(table.c.id == record_id)
+                 .values(values=values | {field: filename}, updated_at=now()))
+    return True
+
+
 def check_signature(mime, prefix):
     if mime == "application/pdf":
         return b"%PDF-" in prefix[:1024]
@@ -145,8 +162,11 @@ def register_original(db, kind, record_id, original, context):
         context.log("warning", f"原件 {filename}：{message[:240]}", url)
     with db.write() as conn:
         context.active(conn)
-        conn.execute(update(attachments).where(attachments.c.id == row["id"],
+        saved = conn.execute(update(attachments).where(attachments.c.id == row["id"],
             attachments.c.kind == kind, attachments.c.record_id == record_id, attachments.c.identity == identity).values(**updated))
+        if (saved.rowcount and kind == "papers" and original.role == "source_pdf"
+                and updated.get("mime_type") == "application/pdf"):
+            fill_paper_pdf_name(conn, record_id, filename)
 
 
 class LinkOnly(Exception):
@@ -255,10 +275,6 @@ def upload_original(db, kind, record_id, upload, expected_updated_at=None):
     mime = TYPES.get(Path(filename).suffix.lower())
     if mime is None:
         raise ValueError("支持 PDF、Word、Excel、ZIP、PNG、JPEG、GIF 和 WebP")
-    with db.engine.connect() as conn:
-        record_exists(conn, kind, record_id)
-    meta = store_content(db, iter(lambda: upload.file.read(65536), b""), mime)
-    identity = f"manual:{meta['sha256']}"
     table = records[kind]
     with db.write() as conn:
         row = conn.execute(select(table.c["values"], table.c.locked_fields, table.c.updated_at)
@@ -268,6 +284,8 @@ def upload_original(db, kind, record_id, upload, expected_updated_at=None):
         if expected_updated_at and row.updated_at != expected_updated_at:
             from .store import Conflict
             raise Conflict("记录已有更新，请重新打开后上传")
+        meta = store_content(db, iter(lambda: upload.file.read(65536), b""), mime)
+        identity = f"manual:{meta['sha256']}"
         if conn.scalar(select(attachments.c.id).where(
                 attachments.c.kind == kind, attachments.c.record_id == record_id,
                 attachments.c.sha256 == meta["sha256"], attachments.c.fetch_status.in_(("manual", "downloaded"))

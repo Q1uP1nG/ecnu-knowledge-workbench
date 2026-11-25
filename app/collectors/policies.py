@@ -2,6 +2,7 @@ import re
 from datetime import date
 
 from ..store import Entry, local_date
+from .base import text_of
 from .notices import NoticeCollector, article_lines, notice_date
 
 SUPPORT = re.compile(r"申报条件|申报主体|支持对象|资助对象|适用对象|申报对象|申报范围|参评要求|扶持范围|发放对象|适用于")
@@ -9,6 +10,13 @@ AMOUNT = re.compile(r"(?:资助|扶持|补贴|奖励|最高)[^。；\n]{0,65}(?:
 DEADLINE = re.compile(r"(?:申报|申请|报名|填报|提交|受理|申领|截取).{0,12}(?:截止|截至|时间|开放)|(?:截止|截至).{0,12}(?:申报|申请|报名|提交|受理)|评价系统.{0,35}开放")
 TIME_CUTOFF = re.compile(r"(?<!\d)(?:(20\d{2})\s*[-./年]\s*)?(\d{1,2})\s*[-./月]\s*(\d{1,2})(?=[日号]|\D|$)")
 HEADING = re.compile(r"^(?:[一二三四五六七八九十]+[、.]|第[一二三四五六七八九十]+[条章节])")
+SECTION_LABEL = re.compile(
+    r"(?:(?:扶持|支持|资助|申报|申领|参评|适用|发放|培训|报名|参赛)(?:对象|范围|方式|要求|条件|流程|时间|材料)|"
+    r"招募对象|参加见习条件|赛事设置|SYB培训介绍|课程安排|培训基本情况|培训报名方式|"
+    r"资金内容|资金管理原则|资金申报重点|资金申报条件|资金评审程序|申报受理方式)"
+)
+SUMMARY_SECTIONS = re.compile(r"扶持范围|扶持方式|支持范围|支持方式|申报条件|适用范围|发放对象|参评要求|"
+                              r"招募对象|参加见习条件|赛事设置|SYB培训介绍|资金内容")
 PUBLISHER = re.compile(
     r"((?:上海市|普陀区|上海市普陀区)(?:科学技术委员会|科学技术和信息化委员会|经济和信息化委员会|"
     r"商务委员会|发展和改革委员会|文化和旅游局|人力资源和社会保障局|市场监督管理局|"
@@ -77,6 +85,37 @@ def original_date(lines, published):
     return published
 
 
+def policy_outline(article, lines):
+    headings = {line for line in lines if len(line) <= 42 and HEADING.search(line)}
+    for node in article.select("h2,h3,h4,p"):
+        label = text_of(node)
+        bold = node.find(["strong", "b"])
+        if not label or node.find_parent(["table", "li"]):
+            continue
+        if node.name in {"h2", "h3", "h4"} and 2 <= len(label) <= 42:
+            headings.add(label)
+        elif bold is not None and text_of(bold) == label and SECTION_LABEL.fullmatch(label):
+            headings.add(label)
+    ordered = [line for line in lines if line in headings]
+    extracts = []
+    for index, line in enumerate(lines[:-1]):
+        if line not in headings or not SUMMARY_SECTIONS.search(line):
+            continue
+        following = lines[index + 1]
+        if following in headings or len(following) < 15 or not re.search(r"[。；]", following):
+            continue
+        sentence = re.split(r"(?<=。)", following, maxsplit=1)[0]
+        if 15 <= len(sentence) <= 190:
+            extracts.append(f"{line}：{sentence.rstrip('。；')}。")
+    summary = ""
+    for excerpt in extracts[:2]:
+        candidate = (summary or "原文节选：") + (" " if summary else "") + excerpt
+        if len(candidate) > 400:
+            break
+        summary = candidate
+    return " / ".join(ordered[:12]) or None, summary
+
+
 class PolicyCollector(NoticeCollector):
     cap_option = "max_policies"
     record_kinds = ("policies",)
@@ -114,8 +153,8 @@ class PolicyCollector(NoticeCollector):
         funds = [clause for line in lines for clause in re.split(r"[。；]", line) if AMOUNT.search(clause)]
         expiry = cutoff(lines, published)
         validity = ("有效" if expiry == "长期" or expiry >= local_date() else "结束") if expiry else ""
-        summary = next((line for line in lines if len(line) >= 35 and not line.startswith(("http", "附件"))), lines[0])
-        headings = [line for line in lines if len(line) <= 42 and HEADING.search(line)][:12]
+        outline, summary = policy_outline(article, lines)
+        summary = summary or next((line for line in lines if len(line) >= 35 and not line.startswith(("http", "附件"))), lines[0])
         kind = policy_type(title)
         names = [x.filename for x in originals[1:]]
         names += [a.get_text(" ", strip=True) + "（小程序）"
@@ -128,7 +167,7 @@ class PolicyCollector(NoticeCollector):
             "资助金额/力度": "；".join(dict.fromkeys(funds))[:450], "政策发布时间": published,
             "申报截止时间": expiry, "政策有效性": validity,
             "来源": "华东师范大学国家大学科技园", "政策附件": "；".join(names) or "无",
-            "原文目录": " / ".join(headings) or url, "标题": title, "分类": kind, "标签": region,
+            "原文目录": outline, "标题": title, "分类": kind, "标签": region,
             "文件信息": f"{originals[0].filename}（HTML，{len(raw)} 字节）",
             "上传人": "公开来源采集", "状态": "已采集",
         }, url, evidence_date=published, attachments=originals)
