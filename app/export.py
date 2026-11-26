@@ -104,7 +104,7 @@ def save_excel(conn, review, target, strict=False, *, kinds_filter=None, templat
                     if field == spec.title:
                         hints.append("每条记录必填。")
                     if field == spec.code:
-                        hints.append(f"已有记录用编号匹配，新记录可留空自动分配，如 {spec.prefix}001。")
+                        hints.append(f"已有记录用编号匹配。新记录可留空自动分配，如 {spec.prefix}001，也可填外部编号。")
                     if field in CHOICES:
                         hints.append("可选值：" + "、".join(CHOICES[field]))
                     if field in DATES and field not in HINTS:

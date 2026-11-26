@@ -1,10 +1,11 @@
 timezone: Asia/Shanghai
 attachments:
   max_bytes: 52428800
+  private_dns_hosts: [ecnu.edu.cn, stcsm.sh.gov.cn, shpt.gov.cn]
   private_host_networks: {}
   source_hosts:
-    ecnu_kjc_transfer: [kjc.ecnu.edu.cn]
-    shanghai_policies: [kjy.ecnu.edu.cn]
+    ecnu_kjc_transfer: [ecnu.edu.cn]
+    shanghai_policies: [ecnu.edu.cn, stcsm.sh.gov.cn, shpt.gov.cn, gov.cn]
   park_hosts: [kjy.ecnu.edu.cn, ecnu.edu.cn]
   paper_hosts: [arxiv.org, nih.gov, europepmc.org, hal.science, biorxiv.org, medrxiv.org, nature.com, springer.com, springernature.com, wiley.com, mdpi.com, frontiersin.org, plos.org, openreview.net, acm.org, ieee.org, science.org, sciencedirect.com, elsevier.com, taylorandfrancis.com, tandfonline.com, oup.com, cambridge.org, iop.org, ecnu.edu.cn, osf.io, zenodo.org, doi.org]
 http:
@@ -22,7 +23,7 @@ sources:
     applicants: [East China Normal University, 华东师范大学]
     jurisdictions: [CN, WO]
     options:
-      max_patents: 100
+      max_patents: 0
       publication_year: null
       from_date: null
       sort_order: desc
@@ -30,8 +31,9 @@ sources:
     label: 华东师大师资与院系
     cron: "20 3 * * 1"
     options:
-      max_units: 3
-      max_teachers_per_unit: 5
+      max_units: 0
+      max_teachers_per_unit: 0
+      skip_recent_days: 7
     org_url: https://www.ecnu.edu.cn/wzcd/xxgk/yxsz.htm
     faculty_directory: https://faculty.ecnu.edu.cn/_s2/bmlb/list.psp
     faculty_query: https://faculty.ecnu.edu.cn/_wp3services/generalQuery?queryObj=teacherHome
@@ -234,12 +236,21 @@ sources:
       sync_strategy: publication
       sort_order: desc
       download_attachments: false
+  ecnu_lens_scholar:
+    label: 华东师大论文 · Lens 补充
+    cron: "40 4 * * 6"
+    url: https://api.lens.org/scholarly/search
+    ror_id: 02n96ep67
+    start_year: 2024
+    options:
+      max_papers: 0
+      publication_year: null
   ecnu_science_park:
     label: 华东师大国家大学科技园
     cron: "40 3 * * *"
     options:
-      max_news_pages: 1
-      max_news_items: 14
+      max_news_pages: 0
+      max_news_items: 0
       download_attachments: false
     service_urls:
       园区概况:
@@ -270,7 +281,7 @@ sources:
     label: 华东师大科技处 · 专利与成果转化
     cron: "15 5 * * 2"
     options:
-      max_notices: 15
+      max_notices: 0
       download_attachments: true
     page_limit: 5
     listings:
@@ -286,7 +297,7 @@ sources:
     label: 扶持政策 · 科技园与上海市
     cron: "35 5 * * 2"
     options:
-      max_policies: 15
+      max_policies: 0
       download_attachments: true
     page_limit: 5
     listings:

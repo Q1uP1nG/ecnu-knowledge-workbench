@@ -104,15 +104,8 @@ def policy_outline(article, lines):
         following = lines[index + 1]
         if following in headings or len(following) < 15 or not re.search(r"[。；]", following):
             continue
-        sentence = re.split(r"(?<=。)", following, maxsplit=1)[0]
-        if 15 <= len(sentence) <= 190:
-            extracts.append(f"{line}：{sentence.rstrip('。；')}。")
-    summary = ""
-    for excerpt in extracts[:2]:
-        candidate = (summary or "原文节选：") + (" " if summary else "") + excerpt
-        if len(candidate) > 400:
-            break
-        summary = candidate
+        extracts.append(f"{line}：{following}")
+    summary = "原文节选：" + "\n".join(extracts[:2]) if extracts else ""
     return " / ".join(ordered[:12]) or None, summary
 
 
@@ -163,8 +156,8 @@ class PolicyCollector(NoticeCollector):
             names.append("见原文附件清单（二维码）")
         yield Entry("policies", url, {
             "政策名称": title, "政策类型": kind, "发布部门": department, "所属区域": region,
-            "政策摘要": summary[:400], "支持对象": "；".join(dict.fromkeys(support))[:450],
-            "资助金额/力度": "；".join(dict.fromkeys(funds))[:450], "政策发布时间": published,
+            "政策摘要": summary, "支持对象": "；".join(dict.fromkeys(support)),
+            "资助金额/力度": "；".join(dict.fromkeys(funds)), "政策发布时间": published,
             "申报截止时间": expiry, "政策有效性": validity,
             "来源": "华东师范大学国家大学科技园", "政策附件": "；".join(names) or "无",
             "原文目录": outline, "标题": title, "分类": kind, "标签": region,

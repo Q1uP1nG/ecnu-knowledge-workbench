@@ -32,6 +32,7 @@ OPTIONS = {
     "shanghai_policies": {"max_policies": (0, 1000), "download_attachments": bool},
     "ecnu_lens_patents": {"max_patents": (0, 200000), "publication_year": (1900, 2200),
                           "from_date": None, "sort_order": ("asc", "desc")},
+    "ecnu_lens_scholar": {"max_papers": (0, 200000), "publication_year": (1900, 2200)},
 }
 
 def options_for(source_id, raw, *, scoped=False):

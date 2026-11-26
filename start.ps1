@@ -1,6 +1,7 @@
 param(
     [ValidateRange(1, 65535)][int]$Port = 8000,
-    [switch]$Seed
+    [switch]$Seed,
+    [switch]$Lan
 )
 
 $ErrorActionPreference = 'Stop'
@@ -22,5 +23,17 @@ if ($Seed) {
     & $workbenchPython cli.py seed
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
-& $workbenchPython -m uvicorn app.main:app --host 127.0.0.1 --port $Port
-exit $LASTEXITCODE
+$bindAddress = if ($Lan) { '0.0.0.0' } else { '127.0.0.1' }
+$previousAllowedHosts = $env:KB_ALLOWED_HOSTS
+try {
+    if ($Lan -and [string]::IsNullOrWhiteSpace($previousAllowedHosts)) {
+        $addresses = Get-NetIPAddress -AddressFamily IPv4 -AddressState Preferred -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty IPAddress
+        $env:KB_ALLOWED_HOSTS = (@($env:COMPUTERNAME) + @($addresses) | Where-Object { $_ } | Select-Object -Unique) -join ','
+    }
+    & $workbenchPython -m uvicorn app.main:app --host $bindAddress --port $Port
+    $workbenchExitCode = $LASTEXITCODE
+} finally {
+    $env:KB_ALLOWED_HOSTS = $previousAllowedHosts
+}
+exit $workbenchExitCode

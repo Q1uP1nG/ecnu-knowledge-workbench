@@ -1,6 +1,6 @@
 import re
 import unicodedata
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from io import BytesIO
@@ -22,7 +22,7 @@ from .store import doi_key, find_patent, unit_links, write_record
 
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 MAX_EXPANDED_BYTES = 150 * 1024 * 1024
-MAX_ROWS = 50000
+MAX_ROWS = 250000
 TEMPLATE_NAME = "华东师大知识库导入模板.xlsx"
 AUX_COLUMNS = {"院系", "所属学院/系"}
 STATS = ("will_insert", "will_update", "will_skip")
@@ -87,7 +87,7 @@ def data_value(cell, field):
     return value
 
 
-def parse_workbook(payload, errors):
+def parse_workbook(payload, errors, ignored_columns=None):
     with ZipFile(BytesIO(payload)) as package:
         if sum(item.file_size for item in package.infolist()) > MAX_EXPANDED_BYTES:
             raise ValueError("工作簿解压后超过大小上限")
@@ -107,9 +107,6 @@ def parse_workbook(payload, errors):
             # A corrupt or stale dimension must not silently hide rows.
             sheet.reset_dimensions()
             for number, cells in enumerate(sheet.iter_rows(), 1):
-                total_rows += 1
-                if total_rows > MAX_ROWS:
-                    raise ValueError(f"工作簿超过 {MAX_ROWS} 行")
                 flat = [cell.value for cell in cells]
                 nonblank = [item for item in flat if item is not None and str(item).strip()]
                 if not nonblank:
@@ -130,23 +127,30 @@ def parse_workbook(payload, errors):
                     continue
                 if headers is None:
                     allowed = set(column_names(kind)) | (AUX_COLUMNS if sections else set())
-                    headers = [str(value).strip() if value is not None else "" for value in flat]
+                    labels = [str(value).strip() if value is not None else "" for value in flat]
+                    headers = [label if label in allowed or not label else None for label in labels]
                     waiting_header = False
-                    names = [name for name in headers if name]
+                    names = Counter(name for name in headers if name)
                     if SPECS[kind].title not in names:
                         errors.append(row.issue("表头缺少名称字段", SPECS[kind].title))
-                    for name in dict.fromkeys(names):
-                        if name not in allowed or names.count(name) > 1:
-                            errors.append(row.issue("无法识别的表头" if name not in allowed else "表头重复", name))
+                    for name, count in names.items():
+                        if count > 1:
+                            errors.append(row.issue("表头重复", name))
+                    ignored = [label for label, header in zip(labels, headers) if header is None]
+                    if ignored_columns is not None and ignored:
+                        prior = ignored_columns.get(sheet.title, [])
+                        ignored_columns[sheet.title] = list(dict.fromkeys([*prior, *ignored]))
                     continue
                 spec = SPECS[kind]
                 detail_fields = {field: section for section, fields in spec.sections for field in fields}
                 start_errors = len(errors)
                 unit_values = []
+                has_data = False
                 for index, cell in enumerate(cells):
                     field = headers[index] if index < len(headers) else ""
-                    if cell.value is None or isinstance(cell.value, str) and not cell.value.strip():
+                    if field is None or cell.value is None or isinstance(cell.value, str) and not cell.value.strip():
                         continue
+                    has_data = True
                     if not field:
                         errors.append(row.issue("该列缺少表头"))
                         continue
@@ -166,6 +170,11 @@ def parse_workbook(payload, errors):
                             unit_values.append(str(value))
                     except ValueError as exc:
                         errors.append(row.issue(str(exc), field))
+                if not has_data:
+                    continue
+                total_rows += 1
+                if total_rows > MAX_ROWS:
+                    raise ValueError(f"工作簿超过 {MAX_ROWS} 条非空数据行")
                 if not row.values.get(spec.title):
                     errors.append(row.issue("请填写名称", spec.title))
                 if len({name_key(value) for value in unit_values}) > 1:
@@ -349,12 +358,13 @@ def import_xlsx(db, stream, *, dry_run=True, review_status="pending", overwrite_
         raise ValueError("导入审核状态须为待审核或已通过")
     errors = []
     summary = {kind: dict.fromkeys(STATS, 0) for kind in SPECS}
-    result = {"dry_run": dry_run, "committed": False, "tables": summary, "errors": errors, "failed": 0}
+    result = {"dry_run": dry_run, "committed": False, "tables": summary, "errors": errors,
+              "ignored_columns": {}, "failed": 0}
     try:
         payload = stream.read(MAX_UPLOAD_BYTES + 1)
         if len(payload) > MAX_UPLOAD_BYTES:
             raise ValueError("工作簿超过 25 MiB")
-        rows = parse_workbook(payload, errors)
+        rows = parse_workbook(payload, errors, result["ignored_columns"])
         with db.write() as conn:
             save_groups(conn, rows, summary, errors, review_status, overwrite_review)
             if dry_run or errors:

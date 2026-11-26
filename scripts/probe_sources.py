@@ -101,6 +101,16 @@ def probe_lens(collector):
         collector.emit_patent(patent)
 
 
+def probe_lens_scholar(collector):
+    year = int(now()[:4])
+    try:
+        credential = lens_token()
+    except ValueError:
+        raise ValueError("请配置 LENS_API_TOKEN，并确认 Lens 账户已开通 Scholar API。") from None
+    page = collector.request(collector.article_query(year, [], size=1), credential)
+    print("  Lens Scholar 命中华师大学术出版物", page["total"])
+
+
 PROBES = {
     "ecnu_faculty": probe_faculty,
     "ecnu_openalex_papers": probe_papers,
@@ -108,6 +118,7 @@ PROBES = {
     "ecnu_kjc_transfer": probe_notices,
     "shanghai_policies": probe_notices,
     "ecnu_lens_patents": probe_lens,
+    "ecnu_lens_scholar": probe_lens_scholar,
 }
 
 

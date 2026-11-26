@@ -50,6 +50,20 @@ def paper_values(work):
     }
 
 
+def paper_unit_names(db):
+    rows = units(db)
+    aliases = {row["name"]: [row["name"]] for row in rows}
+    config = db.config["sources"]["ecnu_faculty"]
+    for children in config["parents"].values():
+        for name, terms in children.items():
+            aliases.setdefault(name, [name]).extend(terms)
+    for key in ("faculty_aliases", "affiliation_aliases"):
+        for name, terms in config.get(key, {}).items():
+            aliases.setdefault(name, [name]).extend(terms)
+    return [(row["id"], [norm(term) for term in aliases[row["name"]] if len(term) >= 4])
+            for row in rows if row["type"] != "学校"]
+
+
 class OpenAlexCollector(BaseCollector):
     def collect(self):
         if self.options.get("replay_cache"):
@@ -193,17 +207,7 @@ class OpenAlexCollector(BaseCollector):
         self.ctx.log("info", f"本地论文快照重解析 · {len(seen)} 篇")
 
     def unit_names(self):
-        aliases = {row["name"]: [row["name"]] for row in units(self.ctx.db)}
-        config = self.ctx.db.config["sources"]["ecnu_faculty"]
-        for children in config["parents"].values():
-            for name, terms in children.items():
-                aliases.setdefault(name, [name]).extend(terms)
-        for name, terms in config.get("faculty_aliases", {}).items():
-            aliases.setdefault(name, [name]).extend(terms)
-        for name, terms in config.get("affiliation_aliases", {}).items():
-            aliases.setdefault(name, [name]).extend(terms)
-        return [(row["id"], [norm(term) for term in aliases[row["name"]] if len(term) >= 4])
-                for row in units(self.ctx.db) if row["type"] != "学校"]
+        return paper_unit_names(self.ctx.db)
 
     def match_units(self, work, names):
         affiliations = []

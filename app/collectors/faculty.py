@@ -13,7 +13,7 @@ from ..attachments import Original
 from ..db import now, org, records, snapshots, tombstones
 from ..errors import Cancelled
 from ..store import Entry, Unit, descendants, sync_units, units
-from .base import BaseCollector, clean, link, preferred, text_of
+from .base import BaseCollector, FetchError, clean, link, preferred, text_of
 
 SCHOOL = "华东师范大学"
 ROOT_KEY = "ecnu"
@@ -36,6 +36,27 @@ INCIDENTAL_RANK = re.compile(
 EMAIL = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", re.ASCII)
 RESEARCH = re.compile(r"研究方向|研究领域|研究兴趣|Research (?:Interests?|Areas?)", re.I)
 RESULTS = re.compile(r"代表性成果|代表性论文|代表论文|代表著作|科研成果|学术成果|Selected Publications", re.I)
+OTHER_SECTION_HEADING = re.compile(
+    r"(?:个人简介|教育经历|工作经历|社会兼职|学术兼职|教学(?:工作|经历)|招生(?:与培养|招聘|信息|要求)?|"
+    r"联系方式|(?:团队|实验室|课题组)成员|新闻动态|新闻|"
+    r"news(?: and highlights)?|(?:current |former |group )?(?:students|members)|"
+    r"teaching(?: experience)?|contact(?: information)?)",
+    re.I,
+)
+RESEARCH_END_HEADING = re.compile(
+    r"(?:(?:近期|主要|部分|课题组)?(?:代表性)?(?:学术|期刊|科研|研究)?(?:成果|论文|文章)(?:列表|清单)?|"
+    r"(?:list of )?(?:(?:selected|research|recent) )?publications?|"
+    r"科研项目|项目主持|荣誉(?:及奖励)?|获奖情况|(?:academic )?awards(?: and distinctions)?|"
+    r"(?:组内|课题组)研究进展|课题组[^。！？]{1,24}代表性(?:论文|文章)|"
+    r"[^。！？]{1,28}[（(]节选[）)])",
+    re.I,
+)
+OTHER_SECTION_PREFIX = re.compile(r"^(?:学习和工作经历|教育经历|工作经历|联系方式)\s*[：:]")
+RECRUITMENT_LINE = re.compile(
+    r"^(?:(?:updated|更新)\s*20\d{2}\s*[：:]\s*)?"
+    r"(?:招收\s*(?:20\d{2}\s*级\s*)?(?:本科生|硕士生|博士生|研究生)|欢迎[^。！？]{0,55}(?:报考|申请)|非常欢迎)",
+    re.I,
+)
 KEYWORD_LEAD = re.compile(
     r"^(?:近年来(?:的)?研究兴趣主要涉及|研究兴趣主要涉及|目前主要研究|一直致力于|主要从事|主要研究|"
     r"具体方向涉及|重点关注|依托[^，,；;。]{0,35}?团队|(?:主要)?(?:研究方向|研究兴趣|研究领域))\s*(?:[：:]|为|包括)?\s*"
@@ -73,6 +94,16 @@ def profile_key(url):
     return url
 
 
+def is_campus_url(url):
+    try:
+        target = urlsplit(url)
+        host = target.hostname or ""
+        return (target.scheme in {"http", "https"} and target.username is None
+                and target.port != 0 and bool(re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*ecnu\.edu\.cn", host)))
+    except ValueError:
+        return False
+
+
 def norm(name):
     return "".join(char for char in unicodedata.normalize("NFKC", name or "").casefold() if char.isalnum())
 
@@ -93,7 +124,8 @@ def same_profile(candidate, incoming):
         return True
     research = clean("；".join((incoming.get("研究方向详述") or "").splitlines()))
     previous = clean("；".join((candidate.get("研究方向详述") or "").splitlines()))
-    return len(research) >= 28 and research == previous
+    return len(research) >= 28 and (research == previous or
+                                    len(previous) == 200 and research.startswith(previous))
 
 
 def profile_rank(body, name):
@@ -131,6 +163,20 @@ def research_keywords(research):
         ) and term not in keywords:
             keywords.append(term)
     return ",".join(keywords[:5]) or None
+
+
+def subsection_text(nodes, *, research):
+    parts = []
+    for node in nodes:
+        text = text_of(node)
+        if not text:
+            continue
+        label = text.strip("：: ")
+        if OTHER_SECTION_HEADING.fullmatch(label) or OTHER_SECTION_PREFIX.match(text) or (
+                research and (RESEARCH_END_HEADING.fullmatch(label) or RECRUITMENT_LINE.match(text))):
+            break
+        parts.append(text)
+    return parts
 
 
 def unit_type(name, group=""):
@@ -358,7 +404,11 @@ class FacultyCollector(BaseCollector):
 
     def collect_unit(self, unit):
         directory_url = unit["faculty_url"]
-        directory_id = parse_qs(urlsplit(directory_url).query).get("wp_tw_orgId", [""])[0]
+        if not is_campus_url(directory_url):
+            raise ValueError("教师目录须使用华东师范大学校内公开 HTTP 或 HTTPS 地址")
+        target = urlsplit(directory_url)
+        directory_id = (parse_qs(target.query).get("wp_tw_orgId", [""])[0]
+                        if target.hostname == "faculty.ecnu.edu.cn" else "")
         cap = self.options.get("max_teachers_per_unit") or None
         self.ctx.log("info", f'读取 {unit["name"]} 师资目录', directory_url)
         department = self.config.get("department_sources", {}).get(unit["name"])
@@ -366,8 +416,8 @@ class FacultyCollector(BaseCollector):
             return self.collect_department(unit, department, cap)
         batch = ProfileBatch(cap)
         if not directory_id:
-            if urlsplit(directory_url).hostname != "faculty.ecnu.edu.cn":
-                raise ValueError("师资目录必须位于 faculty.ecnu.edu.cn")
+            if target.hostname != "faculty.ecnu.edu.cn":
+                return self.collect_campus_directory(unit, directory_url, batch)
             soup = self.html(directory_url)
             urls = dict.fromkeys(link(directory_url, a.get("href"), "faculty.ecnu.edu.cn")
                                  for a in soup.select(self.selectors["teacher_link"]))
@@ -390,6 +440,33 @@ class FacultyCollector(BaseCollector):
             if batch.truncated or not items or last_page:
                 return batch
         raise ValueError("师资目录超过分页保护上限")
+
+    def fetch_campus_page(self, url):
+        visited = set()
+        while is_campus_url(url) and url not in visited and len(visited) < 5:
+            visited.add(url)
+            try:
+                return self.fetch(url, follow_redirects=False), url
+            except FetchError as exc:
+                if exc.status not in {301, 302, 303, 307, 308} or not getattr(self, "response_location", None):
+                    raise
+                url = link(url, self.response_location)
+        raise ValueError("校内页面跳转离开校内域名或超过保护上限")
+
+    def collect_campus_directory(self, unit, url, batch):
+        raw, directory_url = self.fetch_campus_page(url)
+        soup = BeautifulSoup(raw, "lxml")
+        items = {}
+        for anchor in soup.select(self.selectors["teacher_link"] + ', .wp_articlecontent a[href*="/page.htm"]'):
+            target = link(directory_url, anchor.get("href"))
+            if not target or target == directory_url or not is_campus_url(target):
+                continue
+            if urlsplit(target).path.endswith("/list.htm") and not anchor.find_parent(class_="wp_articlecontent"):
+                continue
+            items.setdefault(profile_key(target), {"cnUrl": target, "title": text_of(anchor)})
+        if not items:
+            raise ValueError("未在自定义院系目录匹配到教师主页，请核对目录内容或配置链接选择器")
+        return self.profiles(unit, items.values(), department=True, batch=batch, campus_only=True)
 
     def collect_department(self, unit, config, cap):
         seen_pages, seen_profiles = set(), set()
@@ -473,7 +550,7 @@ class FacultyCollector(BaseCollector):
             return prior
         return unit
 
-    def profiles(self, unit, items, *, department=False, batch=None):
+    def profiles(self, unit, items, *, department=False, batch=None, campus_only=False):
         if batch is None:
             batch = ProfileBatch()
         targets = [(row, link(self.config["faculty_unit"], row.get("cnUrl"),
@@ -511,8 +588,11 @@ class FacultyCollector(BaseCollector):
                 break
             batch.attempted += 1
             try:
-                raw = self.fetch(url)
-                response_url = getattr(self, "response_url", url)
+                if campus_only:
+                    raw, response_url = self.fetch_campus_page(url)
+                else:
+                    raw = self.fetch(url)
+                    response_url = getattr(self, "response_url", url)
                 target = unit if department else self.canonical_unit(unit, url)
                 if urlsplit(response_url).hostname == "sso.ecnu.edu.cn":
                     name = person_name(row.get("title"))
@@ -522,6 +602,8 @@ class FacultyCollector(BaseCollector):
                                        "所属学院/系": target["name"]}, url, target["id"], None)
                     continue
                 soup = BeautifulSoup(raw, "lxml")
+                if campus_only:
+                    url = response_url
                 if department and urlsplit(url).path == "/_redirect":
                     if urlsplit(response_url).hostname not in {urlsplit(url).hostname, "faculty.ecnu.edu.cn"}:
                         raise ValueError("院系名录跳转到未配置的教师主页域名")
@@ -577,7 +659,7 @@ class FacultyCollector(BaseCollector):
         email = EMAIL.search(email_node.get("href", "") if email_node else text_of(body))
         research, results = self.section_values(body)
         return {
-            "姓名": name, "职称": rank, "所属学院/系": unit_name, "研究方向详述": research[:200] or None,
+            "姓名": name, "职称": rank, "所属学院/系": unit_name, "研究方向详述": research or None,
             "研究方向关键词": research_keywords(research),
             "代表性成果": results or None, "联系邮箱": email.group() if email else None,
         } | ({"备注": title_note} if title_note else {})
@@ -586,24 +668,26 @@ class FacultyCollector(BaseCollector):
         research, results = "", ""
         for node in body.select(self.selectors["research_head"]):
             label = text_of(node)
-            if len(label) > 30 or not (RESEARCH.search(label) or RESULTS.search(label)):
+            is_research, is_results = bool(RESEARCH.search(label)), bool(RESULTS.search(label))
+            if len(label) > 30 or not (is_research or is_results):
                 continue
-            parts = []
-            for sibling in list(node.next_siblings)[:8]:
+            blocks = []
+            for sibling in node.next_siblings:
                 if not getattr(sibling, "name", None):
                     continue
-                if sibling.name in {"h1", "h2", "h3", "h4"} or set(sibling.get("class", [])) & {"tit", "title"}:
+                if sibling.name in {"h1", "h2", "h3", "h4", "h5", "h6"} or set(sibling.get("class", [])) & {"tit", "title", "col_title"}:
                     break
-                parts.extend(text_of(p) for p in sibling.select("li, p") or [sibling] if text_of(p))
-            if not parts and node.parent:
+                blocks.extend(sibling.select("li, p") or [sibling])
+            if not any(text_of(block) for block in blocks) and node.parent:
                 adjacent = node.parent.find_next_sibling()
                 if adjacent and len(text_of(adjacent)) > len(label):
-                    parts = [text_of(p) for p in adjacent.select("li, p") or [adjacent] if text_of(p)]
-            if parts and RESEARCH.search(label) and not research:
+                    blocks = adjacent.select("li, p") or [adjacent]
+            parts = subsection_text(blocks, research=is_research)
+            if parts and is_research and not research:
                 research = "\n".join(parts)
-            if parts and RESULTS.search(label) and not results:
+            if parts and is_results and not results:
                 entries = [part for part in dict.fromkeys(parts) if not re.fullmatch(r"[\u3400-\u9fff]{2,12}[：:]?", part)]
-                results = "\n".join(part[:500] for part in entries[:3])
+                results = "\n".join(entries)
         if not research:
             for item in body.select("p, li"):
                 text = text_of(item)

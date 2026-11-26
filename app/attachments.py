@@ -200,22 +200,29 @@ def fetch_original(db, original, filename, context):
                 context.wait(max(retry_after, http["backoff_seconds"] * 2 ** attempt))
 
 
-def open_original_response(client, url, host, private_networks):
+def open_original_response(client, url, target, private_networks):
+    host = target.hostname
+    port = target.port or (443 if target.scheme == "https" else 80)
     try:
         addresses = dict.fromkeys(ipaddress.ip_address(info[4][0])
-                                  for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM))
+                                  for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
     except socket.gaierror as exc:
         raise httpx.ConnectError("无法解析附件下载域名") from exc
     error = httpx.ConnectError("附件下载域名未返回可用地址")
+    safe_addresses = []
     for address in addresses:
         ip = getattr(address, "ipv4_mapped", None) or address
         allowed_private = any(ip in network for network in private_networks)
-        if not allowed_private and (not ip.is_global or ip.is_multicast or getattr(ip, "is_site_local", False)):
-            raise LinkOnly("附件下载地址解析到非公网 IP")
-    for address in addresses:
+        blocked = ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip.is_multicast or getattr(ip, "is_site_local", False)
+        if not blocked and (ip.is_global or allowed_private):
+            safe_addresses.append(address)
+    if addresses and not safe_addresses:
+        raise LinkOnly("附件下载地址解析到不允许的非公网 IP")
+    for address in safe_addresses:
         # Connect to the checked address while retaining the original hostname for TLS and HTTP.
         request = client.build_request("GET", httpx.URL(url).copy_with(host=str(address)),
-                                       headers={"Host": host}, extensions={"sni_hostname": host})
+                                       headers={"Host": target.netloc},
+                                       extensions={"sni_hostname": host} if target.scheme == "https" else {})
         try:
             return client.send(request, stream=True)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
@@ -225,19 +232,23 @@ def open_original_response(client, url, host, private_networks):
 
 def fetch_original_attempt(client, db, original, filename, context, hosts):
     url = original.url
-    campus_hosts = db.config["attachments"].get("private_host_networks") or {}
+    config = db.config["attachments"]
+    campus_hosts = config.get("private_host_networks") or {}
     for _ in range(5):
         target = urlsplit(url)
         host = target.hostname or ""
-        if target.scheme != "https" or target.username or target.password or target.port not in (None, 443) or not any(
+        if target.scheme not in {"http", "https"} or target.username is not None or target.port == 0 or not any(
                 host == item or host.endswith("." + item) for item in hosts):
             raise LinkOnly("下载地址不在该来源的自动归档域名范围内")
         networks = tuple(ipaddress.ip_network(cidr) for cidr in (campus_hosts.get(host) or ()))
+        if host not in campus_hosts and any(host == item or host.endswith("." + item)
+                                            for item in config.get("private_dns_hosts", ("ecnu.edu.cn",))):
+            networks = PRIVATE_NETWORKS
         if any(not any(network.version == block.version and network.subnet_of(block) for block in PRIVATE_NETWORKS)
                for network in networks):
             raise ValueError("附件私网例外只能使用 RFC 1918 或 IPv6 ULA 网段")
         context.asset_wait()
-        with closing(open_original_response(client, url, host, networks)) as response:
+        with closing(open_original_response(client, url, target, networks)) as response:
             if response.is_redirect and response.headers.get("location"):
                 url = urljoin(url, response.headers["location"])
                 continue

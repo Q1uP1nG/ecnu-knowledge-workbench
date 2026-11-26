@@ -108,9 +108,24 @@ def upsert_entry(conn, source_id, entry, *, return_id=False):
         if found:
             ids.add(found["id"])
         if len(ids) > 1:
-            raise Conflict("OpenAlex ID 与 DOI 分别命中不同论文，请人工核对")
+            raise Conflict("论文标识分别命中不同记录，请人工核对")
         if ids and not found:
             found = conn.execute(select(table).where(table.c.id == ids.pop())).mappings().one()
+    if entry.kind == "papers" and found:
+        previous = found["values"]
+        if source_id == "ecnu_lens_scholar":
+            abstract = values.get("技术摘要")
+            if (abstract and not previous.get("技术摘要") and "技术摘要" not in found["locked_fields"]
+                    and doi_key(previous.get("DOI/链接")) == doi_key(values.get("DOI/链接"))
+                    and doi_key(values.get("DOI/链接"))):
+                conn.execute(update(table).where(table.c.id == found["id"]).values(
+                    values=previous | {"技术摘要": abstract}, updated_at=now()))
+                result = "updated"
+            else:
+                result = "skipped"
+            return (result, found["id"]) if return_id else result
+        if not values.get("技术摘要") and previous.get("技术摘要"):
+            values.pop("技术摘要", None)
     if entry.kind == "companies":
         if found and found["evidence_date"] > entry.evidence_date:
             return ("skipped", found["id"]) if return_id else "skipped"
@@ -327,7 +342,7 @@ def batch_review(db, kind, target, *, ids=None, query="", review=None):
         return result.rowcount
 
 
-def delete_record(db, kind, record_id, expected):
+def delete_record(db, kind, record_id, expected, *, block_recrawl=True):
     table = records[kind]
     with db.write() as conn:
         row = conn.execute(select(table.c.unique_key, table.c.updated_at).where(table.c.id == record_id)).one_or_none()
@@ -336,14 +351,16 @@ def delete_record(db, kind, record_id, expected):
         if expected and expected != row.updated_at:
             raise Conflict("记录已有更新，请重新打开后删除")
         keys = [row.unique_key]
-        if kind == "patents":
+        if block_recrawl and kind == "patents":
             keys.extend(conn.scalars(select(patent_keys.c.key).where(patent_keys.c.record_id == record_id)))
         if kind == "papers":
-            keys.extend(conn.scalars(select(paper_keys.c.key).where(paper_keys.c.record_id == record_id)))
+            if block_recrawl:
+                keys.extend(conn.scalars(select(paper_keys.c.key).where(paper_keys.c.record_id == record_id)))
             conn.execute(delete(paper_keys).where(paper_keys.c.record_id == record_id))
             conn.execute(delete(paper_org).where(paper_org.c.paper_id == record_id))
-        conn.execute(insert(tombstones).on_conflict_do_nothing(),
-                     [{"kind": kind, "key": key, "record_key": row.unique_key} for key in set(keys)])
+        if block_recrawl:
+            conn.execute(insert(tombstones).on_conflict_do_nothing(),
+                         [{"kind": kind, "key": key, "record_key": row.unique_key} for key in set(keys)])
         conn.execute(delete(attachments).where(attachments.c.kind == kind, attachments.c.record_id == record_id))
         conn.execute(delete(table).where(table.c.id == record_id))
 

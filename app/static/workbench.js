@@ -64,13 +64,15 @@ Vue.createApp({
       page: "dashboard", schema: {}, dashboard: {}, units: [], selectedUnit: null, collapsed: {},
       researchKinds: ["faculty", "patents", "papers", "projects"],
       unitTypes: ["学部", "书院", "学院", "系", "研究机构", "直属单位", "学校"],
-      unitKind: "faculty", unitOffset: 0, unitRecords: blankList(), pageSize: 20,
+      unitKind: "faculty", unitOffset: 0, unitRecords: blankList(), pageSize: 20, unitQuery: "", pickerQuery: "",
       sources: [], runs: [], activeRun: null, runInfo: null, runLogs: [], polling: false, startingSources: [],
       library: "services", kind: "services", query: "", review: "", reviews: ["pending", "approved", "ignored"],
       offset: 0, records: blankList(), exportKind: "services", exportReview: "", exportScope: "all",
-      selectedRecords: [], appliedFilter: {}, strictExport: false,
+      selectedRecords: [], appliedFilter: {}, strictExport: false, reviewingBulk: false,
       importFile: null, importReview: "pending", overwriteReview: false, importResult: null, importBusy: false, importError: "",
-      originals: [], uploading: false,
+      dragImport: false, dragOriginal: false,
+      originals: [], uploading: false, related: blankList(), relatedOffset: 0, relatedLoading: false, relatedError: "",
+      allowRecrawl: false, tombstoneRows: [], tombstoneBusy: false,
       metrics: [{ id: "inserted", label: "新增" }, { id: "updated", label: "更新" }, { id: "failed", label: "失败" }],
       selectedMetric: "inserted", selectedDay: "", modal: "", modalTitle: "", modalError: "", editKind: "",
       editingId: null, original: null, draft: {}, saving: false, error: "", notice: "", timer: null, noticeTimer: null,
@@ -131,6 +133,69 @@ Vue.createApp({
       visit(null, 0);
       return rows;
     },
+    filteredTree() {
+      const needle = this.unitQuery.trim().toLowerCase();
+      if (!needle) return this.tree;
+      const byId = new Map(this.units.map(u => [u.id, u]));
+      const keep = new Set();
+      for (const unit of this.units) {
+        if (unit.name.toLowerCase().includes(needle) || (unit.type || "").toLowerCase().includes(needle)) {
+          let cur = unit;
+          while (cur && !keep.has(cur.id)) {
+            keep.add(cur.id);
+            cur = byId.get(cur.parent_id);
+          }
+        }
+      }
+      const groups = new Map(), rows = [];
+      for (const item of this.units) {
+        if (!keep.has(item.id)) continue;
+        if (!groups.has(item.parent_id)) groups.set(item.parent_id, []);
+        groups.get(item.parent_id).push(item);
+      }
+      const visit = (parent, depth) => {
+        for (const item of groups.get(parent) || []) {
+          rows.push({ ...item, depth, hasChildren: groups.has(item.id) });
+          visit(item.id, depth + 1);
+        }
+      };
+      visit(null, 0);
+      return rows;
+    },
+    activeUnitPath() {
+      if (!this.activeUnit) return [];
+      const byId = new Map(this.units.map(u => [u.id, u]));
+      const trail = [];
+      let cur = this.activeUnit;
+      const seen = new Set();
+      while (cur && !seen.has(cur.id)) {
+        seen.add(cur.id);
+        trail.unshift(cur);
+        cur = byId.get(cur.parent_id);
+      }
+      return trail;
+    },
+    filteredPickerUnits() {
+      const needle = this.pickerQuery.trim().toLowerCase();
+      if (!needle) return this.units;
+      const picked = new Set(this.draft.org_unit_ids || []);
+      return this.units.filter(u => picked.has(u.id) || u.name.toLowerCase().includes(needle));
+    },
+    anyRunning() {
+      return this.startingSources.length > 0 ||
+        this.sources.some(source => source.running) ||
+        (this.dashboard.recent || []).some(run => run.status === "running");
+    },
+    coveragePercent() {
+      const eligible = Number(this.dashboard.eligible || 0);
+      if (!eligible) return 0;
+      return Math.min(100, Math.round((Number(this.dashboard.covered || 0) / eligible) * 1000) / 10);
+    },
+    currentPage() { return Math.floor(this.offset / this.pageSize) + 1; },
+    totalPages() { return Math.max(1, Math.ceil((this.records.total || 0) / this.pageSize)); },
+    unitCurrentPage() { return Math.floor(this.unitOffset / this.pageSize) + 1; },
+    unitTotalPages() { return Math.max(1, Math.ceil((this.unitRecords.total || 0) / this.pageSize)); },
+    hasLibraryFilter() { return Boolean(this.query.trim() || this.review); },
     trendRange() {
       const values = this.dashboard.trend;
       return values?.length ? values[0].date.slice(5) + " 至 " + values.at(-1).date.slice(5) : "";
@@ -228,13 +293,31 @@ Vue.createApp({
         const result = await api("records/" + this.unitKind + "?" + new URLSearchParams({
           unit_id: this.selectedUnit, limit: this.pageSize, offset: this.unitOffset,
         }));
-        if (position === this.coordinateUnit()) this.unitRecords = result;
+        if (position === this.coordinateUnit()) {
+          if (result.total > 0 && !result.items.length && this.unitOffset > 0) {
+            this.unitOffset = Math.max(0, Math.floor((result.total - 1) / this.pageSize) * this.pageSize);
+            await this.loadUnitRecords();
+            return;
+          }
+          this.unitRecords = result;
+        }
       } catch (err) { this.error = err.message; }
     },
     selectUnit(id) { this.selectedUnit = id; this.unitOffset = 0; this.unitRecords = blankList(); this.loadUnitRecords(); },
     chooseUnitKind(kind) { this.unitKind = kind; this.unitOffset = 0; this.unitRecords = blankList(); this.loadUnitRecords(); },
-    turnUnit(direction) { this.unitOffset += direction * this.pageSize; this.loadUnitRecords(); },
+    turnUnit(direction) { this.unitOffset = Math.max(0, this.unitOffset + direction * this.pageSize); this.loadUnitRecords(); },
     toggleBranch(id) { this.collapsed[id] = !this.collapsed[id]; },
+    expandAllUnits() { this.collapsed = {}; },
+    collapseAllUnits() {
+      const next = {};
+      for (const unit of this.units) {
+        if (unit.parent_id !== null) next[unit.id] = true;
+      }
+      this.collapsed = next;
+    },
+    isFieldLocked(name) { return Boolean(this.original?.locked_fields?.includes(name)); },
+    lockedFieldCount(item) { return (item.locked_fields || []).filter(k => !k.startsWith("@")).length; },
+    clearLibraryFilters() { this.query = ""; this.review = ""; this.offset = 0; this.loadRecords(); },
     async toggleUnit() {
       try {
         const unit = this.activeUnit;
@@ -313,6 +396,11 @@ Vue.createApp({
           q: this.query, review: this.review, limit: this.pageSize, offset: this.offset,
         }));
         if (requested === this.recordPosition()) {
+          if (result.total > 0 && !result.items.length && this.offset > 0) {
+            this.offset = Math.max(0, Math.floor((result.total - 1) / this.pageSize) * this.pageSize);
+            await this.loadRecords();
+            return;
+          }
           this.records = result;
           this.selectedRecords = [];
           this.appliedFilter = { q: this.query, review: this.review };
@@ -321,8 +409,10 @@ Vue.createApp({
     },
     toggleSelection() { this.selectedRecords = this.selectedPage ? [] : this.records.items.map(item => item.id); },
     async bulkReview(target, filtered = false) {
+      if (this.reviewingBulk) return;
       const count = filtered ? this.records.total : this.selectedRecords.length;
       if (!count || !confirm(`将${filtered ? "当前筛选的" : "选中的"} ${count} 条记录设为「${this.statusName(target)}」？`)) return;
+      this.reviewingBulk = true;
       try {
         const body = filtered ? { target, filtered, ...this.appliedFilter } : { target, ids: this.selectedRecords };
         const result = await api("records/" + this.kind + "/batch-review", "POST", body);
@@ -330,6 +420,7 @@ Vue.createApp({
         await this.loadRecords();
         this.showNotice(`已更新 ${result.updated} 条记录`);
       } catch (err) { this.error = err.message; }
+      finally { this.reviewingBulk = false; }
     },
     async quickReview(record, review) {
       try {
@@ -341,7 +432,7 @@ Vue.createApp({
     async showDialog(modal, title) {
       this.modal = modal; this.modalTitle = title; this.modalError = "";
       await this.$nextTick();
-      this.$refs.dialog.showModal();
+      if (!this.$refs.dialog.open) this.$refs.dialog.showModal();
     },
     closeDialog() { this.modal = ""; this.modalError = ""; this.editingId = null; },
     async openRecord(record, kind = this.kind) {
@@ -349,6 +440,12 @@ Vue.createApp({
       this.editingId = record?.id || null;
       this.original = record ? clone(record) : null;
       this.originals = [];
+      this.related = blankList();
+      this.relatedOffset = 0;
+      this.relatedLoading = false;
+      this.relatedError = "";
+      this.allowRecrawl = false;
+      this.pickerQuery = "";
       const values = record ? clone(record.values) : {};
       for (const section of this.schema[kind].sections) values[section.name] ||= [];
       this.draft = { values, review_status: record?.review_status || "pending", org_unit_id: record?.org_unit_id ?? null,
@@ -362,11 +459,42 @@ Vue.createApp({
       }
       await this.showDialog("record", (record ? "编辑" : "新增") + this.schema[kind].label + "条目");
       if (record) {
+        if (["faculty", "papers"].includes(kind)) this.loadRelated();
         try {
           const files = await api("records/" + kind + "/" + record.id + "/attachments");
           if (this.editingId === record.id && this.editKind === kind) this.originals = files;
         } catch (err) { if (this.editingId === record.id) this.modalError = err.message; }
       }
+    },
+    async loadRelated(offset = 0) {
+      const { editKind, editingId, original } = this;
+      this.relatedLoading = true;
+      this.relatedError = "";
+      try {
+        const result = await api(`records/${editKind}/${editingId}/related?offset=${offset}`);
+        if (this.original === original) {
+          this.related = result;
+          this.relatedOffset = offset;
+        }
+      } catch (err) {
+        if (this.original === original) this.relatedError = err.message;
+      } finally {
+        if (this.original === original) this.relatedLoading = false;
+      }
+    },
+    async openRelated(row) {
+      const { kind: relatedKind } = this.related;
+      const original = this.original;
+      const { expected_updated_at, values, ...meta } = this.recordChanges();
+      if ((Object.keys(values).length || Object.keys(meta).length) && !confirm("切换记录会放弃未保存的修改，继续吗？")) return;
+      try {
+        const record = await api(`records/${relatedKind}/${row.id}`);
+        if (this.modal === "record" && this.original === original) await this.openRecord(record, relatedKind);
+      } catch (err) { if (this.original === original) this.relatedError = err.message; }
+    },
+    relationEvidence(value) {
+      return { orcid: "ORCID", email: "署名邮箱", profile_doi: "教师主页成果 DOI",
+        author_id: "已核对作者 ID", name_unit: "全名与署名院系" }[value] || value;
     },
     openUnit(unit, parent = null) {
       this.editingId = unit?.id || null;
@@ -401,6 +529,7 @@ Vue.createApp({
       return payload;
     },
     async uploadFiles(event) {
+      this.dragOriginal = false;
       const files = Array.from(event.dataTransfer?.files || event.target.files || []);
       if (!this.editingId || !files.length || this.uploading) return;
       this.uploading = true;
@@ -438,11 +567,14 @@ Vue.createApp({
       }
     },
     async removeRecord() {
-      if (this.saving || this.uploading || !confirm("删除这条记录及其原件引用。后续采集也会跳过这条记录。继续？")) return;
+      const blockRecrawl = !this.allowRecrawl;
+      const detail = blockRecrawl ? "后续采集将跳过这条记录。" : "后续采集可重新入库。";
+      if (this.saving || this.uploading || !confirm("删除这条记录及其原件引用。" + detail + "继续？")) return;
       this.saving = true;
       try {
         await api(`records/${this.editKind}/${this.editingId}?` + new URLSearchParams({
           expected_updated_at: this.original.updated_at,
+          block_recrawl: String(blockRecrawl),
         }), "DELETE");
         this.$refs.dialog.close();
         if (this.page === "units") await this.loadUnitRecords();
@@ -451,7 +583,36 @@ Vue.createApp({
       } catch (err) { this.modalError = err.message; }
       finally { this.saving = false; }
     },
+    async openTombstones() {
+      if (this.tombstoneBusy) return;
+      const kind = this.kind;
+      this.tombstoneRows = [];
+      this.tombstoneBusy = true;
+      try {
+        await this.showDialog("tombstones", this.schema[kind].label + " · 重采拦截");
+        const rows = await api("tombstones?" + new URLSearchParams({ kind }));
+        if (this.modal === "tombstones") {
+          const grouped = new Map(rows.map(row => [row.record_key || row.key, row]));
+          this.tombstoneRows = Array.from(grouped.values());
+        }
+      } catch (err) {
+        if (this.modal === "tombstones") this.modalError = err.message;
+      } finally { this.tombstoneBusy = false; }
+    },
+    async restoreTombstone(row) {
+      if (this.tombstoneBusy) return;
+      this.tombstoneBusy = true;
+      this.modalError = "";
+      try {
+        await api("tombstones/restore", "POST", { kind: row.kind, key: row.key });
+        this.tombstoneRows = this.tombstoneRows.filter(item => item.key !== row.key);
+        this.showNotice("已解除重采拦截");
+      } catch (err) {
+        if (this.modal === "tombstones") this.modalError = err.message;
+      } finally { this.tombstoneBusy = false; }
+    },
     async saveModal() {
+      if (this.modal === "tombstones") return;
       if (this.saving || this.uploading) return;
       this.modalError = ""; this.saving = true;
       try {
@@ -484,6 +645,7 @@ Vue.createApp({
       finally { this.saving = false; }
     },
     chooseImportFile(file) {
+      this.dragImport = false;
       if (this.importBusy) return;
       this.importResult = null;
       this.importError = file && !/\.xlsx$/i.test(file.name) ? "请选择 .xlsx 工作簿" : "";

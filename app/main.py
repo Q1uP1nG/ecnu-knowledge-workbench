@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from os import getenv
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -14,14 +15,17 @@ from starlette.background import BackgroundTask
 
 from .attachments import IMAGE_TYPES, list_attachments, original_path, upload_original
 from .collectors import COLLECTORS
+from .collectors.faculty import is_campus_url
 from .db import ROOT, Database, attachments, logs, org, records, runs, snapshots, sources
 from .demo import seed
 from .errors import NotFound
 from .export import GROUPS, SCHOOL_KINDS, SCHOOL_WORKBOOK_NAME, WORKBOOK_NAME, bundle_file, excel_file, json_lines
 from .importer import TEMPLATE_NAME, import_xlsx, template_xlsx
+from .paper_faculty import related_records
 from .runner import RunManager, Scheduler, cron_trigger, options_for
 from .schema import REVIEW, SPECS, catalog
-from .store import Conflict, batch_review, delete_record, descendants, list_records, local_date, save_record, unit_links, units
+from .store import (Conflict, batch_review, delete_record, descendants, list_records, list_tombstones, local_date,
+                    restore_tombstone, save_record, unit_links, units)
 
 STATIC = ROOT / "app" / "static"
 UNIT_TYPES = ("学校", "学部", "书院", "学院", "系", "研究机构", "直属单位")
@@ -66,13 +70,16 @@ class BulkReviewForm(BaseModel):
     review: str | None = None
 
 
-def ensure_url(url, *, faculty=False, department_url=None):
+class RestoreTombstoneForm(BaseModel):
+    kind: str
+    key: str = Field(min_length=1)
+
+
+def ensure_url(url):
     if url:
         target = urlsplit(url)
-        if target.scheme not in {"http", "https"} or not target.hostname or target.username or target.password:
+        if target.scheme not in {"http", "https"} or not target.hostname or target.username is not None or target.port == 0:
             raise ValueError("链接须为可公开访问的 HTTP 或 HTTPS 地址")
-        if faculty and target.hostname != "faculty.ecnu.edu.cn" and url != department_url:
-            raise ValueError("使用校级教师目录或配置中的院系官方名录")
 
 
 def ensure_kind(kind):
@@ -122,15 +129,18 @@ def create_app(db_path=None):
             db.engine.dispose()
 
     app = FastAPI(title="华东师范大学 & 科技园 AI 知识库工作台", version="1.2.0", lifespan=lifespan)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"])
+    hosts = ["127.0.0.1", "localhost", "[::1]", "testserver"]
+    hosts.extend(host.strip().lower() for host in getenv("KB_ALLOWED_HOSTS", "").split(",") if host.strip())
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=hosts, www_redirect=False)
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
     @app.middleware("http")
     async def protect_browser_writes(request: Request, call_next):
         if request.url.path.startswith("/api/") and request.method not in {"GET", "HEAD", "OPTIONS"}:
             origin = request.headers.get("origin", request.headers.get("referer"))
+            expected = web_origin(str(request.url))
             if request.headers.get("sec-fetch-site") == "cross-site" or (
-                    origin is not None and web_origin(origin) != web_origin(str(request.url))):
+                    origin is not None and (expected is None or web_origin(origin) != expected)):
                 return JSONResponse(status_code=403, content={"detail": "请从工作台页面发起此操作"})
         return await call_next(request)
 
@@ -205,9 +215,9 @@ def create_app(db_path=None):
                 raise ValueError("上级单位无效或会形成循环")
             if old.get("unit_key") == "ecnu" and (kind != "学校" or parent is not None):
                 raise ValueError("学校根节点须保留在顶层")
-            for key in ("website_url", "faculty_url"):
-                department = db.config["sources"]["ecnu_faculty"].get("department_sources", {}).get(name, {})
-                ensure_url(candidate.get(key), faculty=key == "faculty_url", department_url=department.get("url"))
+            ensure_url(candidate.get("website_url"))
+            if candidate.get("faculty_url") and not is_campus_url(candidate["faculty_url"]):
+                raise ValueError("教师目录须使用华东师范大学校内公开 HTTP 或 HTTPS 地址")
             if any(row["name"] == name and row["parent_id"] == parent and row["id"] != unit_id for row in rows):
                 raise Conflict("同一上级已有同名院系")
             values = {key: candidate.get(key) or "" for key in ("website_url", "faculty_url")}
@@ -316,6 +326,13 @@ def create_app(db_path=None):
                 raise NotFound("记录不存在")
             return unit_links(conn, [dict(row)])[0] if kind == "papers" else dict(row)
 
+    @app.get("/api/records/{kind}/{record_id}/related")
+    def record_relations(kind: str, record_id: int, limit: int = Query(10, ge=1, le=100),
+                         offset: int = Query(0, ge=0)):
+        if kind not in {"faculty", "papers"}:
+            raise NotFound("此类记录没有作者关联")
+        return related_records(app.state.db, kind, record_id, limit, offset)
+
     @app.post("/api/records/{kind}/batch-review")
     def bulk_review(kind: str, form: BulkReviewForm):
         ensure_kind(kind)
@@ -327,10 +344,21 @@ def create_app(db_path=None):
                     query=form.q.strip(), review=filter_review(form.review))}
 
     @app.delete("/api/records/{kind}/{record_id}", status_code=204)
-    def remove_record(kind: str, record_id: int, expected_updated_at: str | None = None):
+    def remove_record(kind: str, record_id: int, expected_updated_at: str | None = None, block_recrawl: bool = True):
         ensure_kind(kind)
-        delete_record(app.state.db, kind, record_id, expected_updated_at)
+        delete_record(app.state.db, kind, record_id, expected_updated_at, block_recrawl=block_recrawl)
         return Response(status_code=204)
+
+    @app.get("/api/tombstones")
+    def get_tombstones(kind: str | None = None):
+        if kind is not None:
+            ensure_kind(kind)
+        return list_tombstones(app.state.db, kind)
+
+    @app.post("/api/tombstones/restore")
+    def restore_blocked_record(form: RestoreTombstoneForm):
+        ensure_kind(form.kind)
+        return {"restored": restore_tombstone(app.state.db, form.kind, form.key)}
 
     @app.get("/api/records/{kind}/{record_id}/attachments")
     def record_attachments(kind: str, record_id: int):

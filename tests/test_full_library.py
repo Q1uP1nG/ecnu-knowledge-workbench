@@ -22,6 +22,7 @@ from sqlalchemy import delete, insert, select, update
 import cli
 from app.attachments import LinkOnly, Original, clean_filename, fetch_original, register_original
 from app.collectors import COLLECTORS
+from app.collectors.base import FetchError
 from app.collectors.faculty import FacultyCollector, ProfileBatch, person_name, profile_key, research_keywords, same_profile
 from app.collectors.openalex import OpenAlexCollector
 from app.collectors.park import ScienceParkCollector
@@ -29,7 +30,7 @@ from app.collectors.policies import PolicyCollector
 from app.collectors.transfer import TransferCollector, patent_affiliation, person_names
 from app.db import Database, ROOT, attachments, digest, now, org, paper_keys, records, runs, snapshots, sources, tombstones
 from app.errors import Cancelled
-from app.export import school_coverage_csv, school_paper_links_csv
+from app.export import json_lines, school_coverage_csv, school_paper_links_csv
 from app.faculty_merge import merge_faculty
 from app.main import create_app
 from app.maintenance import cleanup
@@ -360,7 +361,7 @@ class FullLibrary(unittest.TestCase):
         roster = [Unit("a", "甲院", "学院", faculty_url=f"{home}/?wp_tw_orgId=example")]
         rows = [{"cnUrl": f"{home}/profile/{i}", "title": f"教师{i}"} for i in range(52)]
         manager = RunManager(self.db)
-        options = {"max_units": 0, "max_teachers_per_unit": 5}
+        options = {"max_units": 0, "max_teachers_per_unit": 5, "skip_recent_days": 0}
         with patch.object(FacultyCollector, "discover", return_value=roster), \
              patch.object(FacultyCollector, "directory_api", side_effect=[{"data": rows, "total": 80},
                                                                          {"data": rows[:5], "total": 5}]), \
@@ -392,6 +393,36 @@ class FullLibrary(unittest.TestCase):
              patch.object(collector, "fetch", return_value=b"<main>Profile</main>") as fetch:
             self.assertTrue(collector.collect_department(unit, {"url": home}, 1).truncated)
         fetch.assert_called_once_with(first)
+
+    def test_custom_campus_teacher_directory_saves_and_collects_without_yaml_entry(self):
+        home = "http://new-lab.ecnu.edu.cn:8080/teachers"
+        url = "http://new-lab.ecnu.edu.cn:8080/wang/page.htm"
+        with TestClient(create_app(self.path)) as client:
+            response = client.post("/api/units", json={"name": "测试实验室", "type": "研究机构", "faculty_url": home})
+            self.assertEqual(response.status_code, 201, response.text)
+            unit = response.json()
+            denied = client.patch(f"/api/units/{unit['id']}", json={"faculty_url": "http://ecnu.edu.cn.example.com/list.htm"})
+            self.assertEqual(denied.status_code, 422)
+        collector = self.collector(FacultyCollector, FACULTY)
+        collector.ctx.log, collector.ctx.emit, collector.ctx.failure = Mock(), Mock(), Mock()
+        page = b'<div class="wp_articlecontent"><a href="/wang/page.htm">Teacher</a><a href="https://outside.example/a/main.psp">External</a></div>'
+        detail = '<meta charset="utf-8"><h1 class="arti_title">王老师</h1><main><p>教授</p></main>'.encode()
+        with patch.object(collector, "fetch", side_effect=[page, detail]) as fetch:
+            self.assertEqual(collector.collect_unit(unit).attempted, 1)
+        self.assertEqual(fetch.call_args_list, [call(home, follow_redirects=False), call(url, follow_redirects=False)])
+        self.assertEqual(collector.ctx.emit.call_args.args[0].url, url)
+        with patch.object(collector, "fetch", return_value=b"<main>No directory</main>"):
+            with self.assertRaisesRegex(ValueError, "未在自定义院系目录匹配"):
+                collector.collect_unit(unit)
+
+    def test_custom_campus_directory_checks_redirect_before_fetching(self):
+        collector = self.collector(FacultyCollector, FACULTY)
+        collector.response_location = "http://not-campus.example/teachers"
+        url = "https://new-lab.ecnu.edu.cn/teachers"
+        with patch.object(collector, "fetch", side_effect=FetchError("HTTP 302", 302)) as fetch:
+            with self.assertRaisesRegex(ValueError, "跳转离开校内域名"):
+                collector.fetch_campus_page(url)
+            fetch.assert_called_once_with(url, follow_redirects=False)
 
     def test_faculty_all_detail_failures_schedule_unit_retry(self):
         home = "https://faculty.ecnu.edu.cn"
@@ -558,6 +589,80 @@ class FullLibrary(unittest.TestCase):
             self.assertEqual(upsert_entry(conn, POLICY, row), "inserted")
             self.assertEqual(upsert_entry(conn, POLICY, row), "skipped")
 
+    def test_unlimited_notices_pass_configured_page_limit_and_keep_guard(self):
+        collector = self.collector(PolicyCollector, POLICY)
+        collector.config = collector.config | {"page_limit": 1, "listings": [
+            {"url": "https://kjy.ecnu.edu.cn/list1.htm", "type": "application"},
+        ]}
+        collector.ctx.log = Mock()
+        def listing(url):
+            page = int(url.split("list")[-1].split(".")[0])
+            html = f'<div class="news-title"><a href="/{page}/page.htm">测试申报</a></div>'
+            html += f'<div class="wp_paging"><div class="page_nav"><a href="/list{page + 1}.htm">下一页</a></div></div>'
+            return BeautifulSoup(html, "lxml")
+
+        with patch.object(collector, "html", side_effect=listing) as fetch:
+            collector.options["max_policies"] = 15
+            self.assertEqual(len(list(collector.articles())), 1)
+            self.assertTrue(collector.ctx.partial)
+            self.assertEqual(fetch.call_count, 1)
+            collector.ctx.partial = False
+            collector.options["max_policies"] = 0
+            self.assertEqual(len(list(collector.articles())), 100)
+            self.assertTrue(collector.ctx.partial)
+            self.assertEqual(fetch.call_count, 101)
+        with patch.object(PolicyCollector, "collect", autospec=True) as run:
+            result = RunManager(self.db).execute(POLICY, overrides={"max_policies": 15}, unlimited=True, dry_run=True)
+        self.assertFalse(result["failed"])
+        self.assertEqual(run.call_args.args[0].options["max_policies"], 0)
+
+    def test_daily_collection_defaults_drop_demo_caps_and_preserve_saved_options(self):
+        expected = {
+            FACULTY: {"max_units": 0, "max_teachers_per_unit": 0, "skip_recent_days": 7},
+            PARK: {"max_news_pages": 0, "max_news_items": 0},
+            TRANSFER: {"max_notices": 0},
+            POLICY: {"max_policies": 0},
+            "ecnu_lens_patents": {"max_patents": 0},
+        }
+        for source, subset in expected.items():
+            with self.subTest(source=source):
+                actual = self.db.source(source)["options"]
+                self.assertEqual({key: actual[key] for key in subset}, subset)
+        with self.db.write() as conn:
+            conn.execute(update(sources).where(sources.c.id == POLICY).values(options={"max_policies": 3}))
+        self.assertEqual(self.db.source(POLICY)["options"]["max_policies"], 3)
+
+    def test_long_collector_fields_are_kept_in_storage_and_jsonl(self):
+        faculty = self.collector(FacultyCollector, FACULTY)
+        research = "量子物理与计算方法" * 42
+        works = [f"Selected work {i}" + " paragraphs" * 50 for i in range(12)]
+        soup = BeautifulSoup(f"<main><h3>研究方向</h3><p>{research}</p><h3>代表性成果</h3>" +
+                             "".join(f"<p>{value}</p>" for value in works) + "</main>", "lxml")
+        person = faculty.profile_values(soup, {"title": "测试教师"}, "测试学院")
+        self.assertEqual(person["研究方向详述"], research)
+        self.assertEqual(person["代表性成果"].splitlines(), works)
+        policy = self.collector(PolicyCollector, POLICY)
+        summary, support = "产业政策具体措施" * 90 + "。", "支持对象为" + "符合本区重点产业方向的主体" * 50 + "。"
+        grants = "；".join(f"最高可资助{n}万元，并按申报细则分期兑现奖励额度" for n in range(50))
+        content = (f'<meta charset="utf-8"><h1 class="title-info">测试申报</h1><div class="wp_articlecontent">'
+                   f"<p>{summary}</p><p>{support}</p><p>{grants}</p></div>")
+        notice, = policy.entries("https://kjy.ecnu.edu.cn/notice/page.htm", content.encode(), "2026-01-01")
+        self.assertEqual(notice.values["政策摘要"], summary)
+        self.assertEqual(notice.values["支持对象"], support)
+        self.assertEqual(notice.values["资助金额/力度"], grants)
+        park = self.collector(ScienceParkCollector, PARK)
+        intro = "上海测试有限公司是一家" + "专注技术解决方案的高新技术企业" * 43 + "。"
+        company, = park.company_values(BeautifulSoup(f"<p>{intro}</p>", "lxml"), "上海测试有限公司")
+        self.assertEqual(company["技术特色"], intro)
+        with self.db.write() as conn:
+            upsert_entry(conn, FACULTY, Entry("faculty", "test-long", person, ""))
+            upsert_entry(conn, POLICY, notice)
+            upsert_entry(conn, PARK, Entry("companies", "test-long", company, ""))
+        exported = [json.loads(row) for row in json_lines(self.db, ("faculty", "policies", "companies"), None)]
+        self.assertEqual(exported[0]["字段"]["研究方向详述"], research)
+        self.assertEqual(exported[1]["字段"]["资助金额/力度"], grants)
+        self.assertEqual(exported[2]["字段"]["技术特色"], intro)
+
     def test_policy_outline_is_body_evidence_and_not_source_url(self):
         collector = self.collector(PolicyCollector, POLICY)
         url = "https://kjy.ecnu.edu.cn/example/page.htm"
@@ -625,6 +730,22 @@ class FullLibrary(unittest.TestCase):
         self.assertEqual(values["代表性成果"], "Selected paper, 2025.")
         self.assertTrue(same_profile({"研究方向详述": expected.replace("\n", "；")}, values))
 
+    def test_faculty_long_text_stops_at_unrelated_inline_sections(self):
+        collector = self.collector(FacultyCollector, FACULTY)
+        soup = BeautifulSoup("""
+            <main><h3>研究方向</h3><div>
+            <p>量子化学方法及其应用。</p><p>多体计算与分子动力学。</p>
+            <p><strong>News and Highlights:</strong></p><p>实验室的新闻。</p>
+            </div><h3>代表性成果</h3><div>
+            <p>Selected Publications:</p><p>First paper, 2025.</p>
+            <p>科研项目：</p><p>量子化学计算方法研究项目。</p>
+            <p>Current Students:</p><p>团队学生名单。</p></div></main>
+        """, "lxml")
+        research, works = collector.section_values(soup.main)
+        self.assertEqual(research, "量子化学方法及其应用。\n多体计算与分子动力学。")
+        self.assertIn("量子化学计算方法研究项目。", works)
+        self.assertNotIn("团队学生名单", works)
+
     def test_keyword_and_company_intro_cleaning(self):
         text = "依托华东师范大学集成电路学院团队，近年来的研究兴趣主要涉及大模型隐私安全）；" \
                "具体方向涉及量子磁性态等)，目前主要研究这一整段包含二十多个中文字不该当关键词，AI & Society"
@@ -690,7 +811,36 @@ class FullLibrary(unittest.TestCase):
                 fetch_original(self.db, Original("policy_attachment", target), "demo.pdf", ctx)
         self.assertEqual(send.call_count, 1)
 
-    def test_attachment_private_dns_requires_exact_host_and_approved_network(self):
+    def test_attachment_http_and_redirect_pick_real_ports_and_keep_original_host(self):
+        ctx = SimpleNamespace(source_id=POLICY, asset_wait=Mock(), log=Mock(), wait=Mock())
+        sent = []
+        def serve(request):
+            sent.append((str(request.url), request.headers["Host"], request.extensions.get("sni_hostname")))
+            if len(sent) == 1:
+                return httpx.Response(302, headers={"Location": "https://stcsm.sh.gov.cn:8443/file.pdf"})
+            return httpx.Response(200, content=b"%PDF-1.4\nfixture", headers={"Content-Type": "application/pdf"})
+        def resolved(host, port, **kwargs):
+            addr = "10.23.4.5" if host.endswith(".ecnu.edu.cn") else "93.184.216.34"
+            return [(None, None, None, "", (addr, port))]
+        client = httpx.Client
+        with patch("app.attachments.httpx.Client", side_effect=lambda **kw: client(transport=httpx.MockTransport(serve), **kw)), \
+             patch("app.attachments.socket.getaddrinfo", side_effect=resolved) as dns:
+            fetch_original(self.db, Original("policy_attachment", "http://new.ecnu.edu.cn/files.pdf"), "file.pdf", ctx)
+        self.assertEqual([c.args[:2] for c in dns.call_args_list], [("new.ecnu.edu.cn", 80), ("stcsm.sh.gov.cn", 8443)])
+        self.assertEqual(sent, [("http://10.23.4.5/files.pdf", "new.ecnu.edu.cn", None),
+                               ("https://93.184.216.34:8443/file.pdf", "stcsm.sh.gov.cn:8443", "stcsm.sh.gov.cn")])
+
+    def test_attachment_blocked_ip_categories_are_not_connected(self):
+        ctx = SimpleNamespace(source_id=POLICY, asset_wait=Mock(), log=Mock(), wait=Mock())
+        url = "http://new.ecnu.edu.cn:8080/file.pdf"
+        for address in ("127.1.2.3", "0.0.0.0", "169.254.169.254", "224.0.0.1", "::1", "::", "fe80::1", "ff00::1", "::ffff:127.0.0.1"):
+            with self.subTest(address=address), patch("app.attachments.httpx.Client.send") as send, \
+                 patch("app.attachments.socket.getaddrinfo", return_value=[(None, None, None, "", (address, 8080))]):
+                with self.assertRaises(LinkOnly):
+                    fetch_original(self.db, Original("policy_attachment", url), "file.pdf", ctx)
+                send.assert_not_called()
+
+    def test_attachment_campus_private_dns_and_configured_network_override(self):
         host = "kjy.ecnu.edu.cn"
         url = f"https://{host}/file.pdf"
         from_private = Original("policy_attachment", url)
@@ -710,20 +860,20 @@ class FullLibrary(unittest.TestCase):
         ctx = SimpleNamespace(source_id=POLICY, asset_wait=Mock(), log=Mock(), wait=Mock())
         with patch("app.attachments.httpx.Client", side_effect=lambda **kw: client(transport=httpx.MockTransport(send), **kw)), \
              patch("app.attachments.socket.getaddrinfo", side_effect=resolved):
-            with self.assertRaises(LinkOnly):
-                fetch_original(self.db, from_private, "file.pdf", ctx)
+            meta, _ = fetch_original(self.db, from_private, "file.pdf", ctx)
+            self.assertEqual(meta["mime_type"], "application/pdf")
             self.db.config["attachments"]["private_host_networks"] = {host: ["10.25.8.42/32"]}
             meta, _ = fetch_original(self.db, from_private, "file.pdf", ctx)
             self.assertEqual(meta["mime_type"], "application/pdf")
             with self.assertRaises(LinkOnly):
-                fetch_original(self.db, Original("policy_attachment", f"https://files.{host}/file.pdf"), "file.pdf", ctx)
+                fetch_original(self.db, Original("policy_attachment", "https://www.gov.cn/file.pdf"), "file.pdf", ctx)
             address = "10.25.8.43"
             with self.assertRaises(LinkOnly):
                 fetch_original(self.db, from_private, "file.pdf", ctx)
             self.db.config["attachments"]["private_host_networks"][host] = ["127.0.0.0/8"]
             with self.assertRaisesRegex(ValueError, "RFC 1918"):
                 fetch_original(self.db, from_private, "file.pdf", ctx)
-        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_count, 2)
 
     def test_cancel_interrupts_retry_wait(self):
         manager = RunManager(self.db)
@@ -870,6 +1020,52 @@ class FullLibrary(unittest.TestCase):
             self.assertFalse(first.json()["duplicate"])
             self.assertTrue(second.json()["duplicate"])
             self.assertEqual(len(client.get(endpoint).json()), 1)
+
+    def test_tombstone_web_restore_and_delete_without_recrawl_block(self):
+        doi = "https://doi.org/10.1000/example"
+        entry = Entry("papers", "openalex:test", {"论文标题": "测试论文", "DOI/链接": doi},
+                      "https://openalex.org/W1", aliases=("doi:10.1000/example",))
+        with self.db.write() as conn:
+            _, row_id = upsert_entry(conn, PAPERS, entry, return_id=True)
+        with TestClient(create_app(self.path)) as client:
+            url = f"/api/records/papers/{row_id}"
+            self.assertEqual(client.delete(url, params={"expected_updated_at": "stale"}).status_code, 409)
+            timestamp = client.get(url).json()["updated_at"]
+            self.assertEqual(client.delete(url, params={"expected_updated_at": timestamp}).status_code, 204)
+            marks = client.get("/api/tombstones", params={"kind": "papers"}).json()
+            self.assertEqual({item["key"] for item in marks}, {"openalex:test", "doi:10.1000/example"})
+            self.assertEqual(client.get("/api/tombstones", params={"kind": "faculty"}).json(), [])
+            self.assertEqual(client.get("/api/tombstones", params={"kind": "unknown"}).status_code, 404)
+            with self.db.write() as conn:
+                self.assertEqual(upsert_entry(conn, PAPERS, entry), "skipped")
+            reply = client.post("/api/tombstones/restore", json={"kind": "papers", "key": marks[0]["key"]})
+            self.assertEqual(reply.json(), {"restored": 2})
+            self.assertEqual(client.get("/api/tombstones").json(), [])
+            with self.db.write() as conn:
+                result, again = upsert_entry(conn, PAPERS, entry, return_id=True)
+                self.assertEqual(result, "inserted")
+            self.assertEqual(client.delete(f"/api/records/papers/{again}", params={"block_recrawl": "false"}).status_code, 204)
+            self.assertEqual(client.get("/api/tombstones").json(), [])
+            with self.db.write() as conn:
+                self.assertEqual(upsert_entry(conn, PAPERS, entry), "inserted")
+
+    def test_lan_allowed_hosts_and_same_origin_port(self):
+        address = "http://192.168.20.15:8123"
+        body = {"values": {"标题": "局域网测试"}}
+        with patch.dict("os.environ", {"KB_ALLOWED_HOSTS": ""}), TestClient(create_app(self.path), base_url=address) as client:
+            self.assertEqual(client.get("/api/health").status_code, 400)
+        with patch.dict("os.environ", {"KB_ALLOWED_HOSTS": "workbench.lan, 192.168.20.15"}), \
+             TestClient(create_app(self.path), base_url=address) as client:
+            self.assertEqual(client.get("/api/health").status_code, 200)
+            url = "/api/records/services"
+            self.assertEqual(client.post(url, json=body, headers={"Origin": address}).status_code, 201)
+            self.assertEqual(client.post(url, json=body, headers={"Origin": "http://192.168.20.15:8000"}).status_code, 403)
+            self.assertEqual(client.post(url, json=body, headers={"Origin": "https://192.168.20.15:8123"}).status_code, 403)
+            self.assertEqual(client.post(url, json=body, headers={"Sec-Fetch-Site": "cross-site"}).status_code, 403)
+            self.assertEqual(client.get("http://workbench.lan:8123/api/health").status_code, 200)
+            self.assertEqual(client.get("http://unlisted.lan:8123/api/health").status_code, 400)
+        with patch.dict("os.environ", {"KB_ALLOWED_HOSTS": "*"}), TestClient(create_app(self.path), base_url=address) as client:
+            self.assertEqual(client.get("http://unlisted.lan:8123/api/health").status_code, 200)
 
     def test_tombstones_restore_cli_releases_aliases(self):
         entry = Entry("papers", "openalex:W100", {"论文标题": "测试论文"}, "",

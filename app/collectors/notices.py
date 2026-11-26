@@ -65,12 +65,13 @@ class NoticeCollector(BaseCollector):
 
     def articles(self):
         selectors = self.config["selectors"]
+        page_limit = self.config.get("page_limit", 5) if self.options.get(self.cap_option) else 100
         seen_articles = set()
         for listing in self.config["listings"]:
             url = listing["url"]
             host = urlsplit(url).hostname
             visited = set()
-            while url and url not in visited and len(visited) < self.config["page_limit"]:
+            while url and url not in visited and len(visited) < page_limit:
                 page = self.html(url)
                 visited.add(url)
                 anchors = page.select(selectors["list_link"])
@@ -82,6 +83,11 @@ class NoticeCollector(BaseCollector):
                         yield target, published
                 following = next((a for a in page.select(selectors["next_page"]) if "下一页" in text_of(a)), None)
                 url = link(url, following.get("href"), host) if following else ""
+            if url:
+                if url in visited:
+                    raise ValueError("公示列表分页出现循环")
+                self.ctx.partial = True
+                self.ctx.log("info", f"公示列表达到 {page_limit} 页上限，后续页面未采集", url)
 
     def parts(self, url, raw, listing_date):
         soup = BeautifulSoup(raw, "lxml")
@@ -101,6 +107,9 @@ class NoticeCollector(BaseCollector):
             return
         cap = self.options.get(self.cap_option)
         for index, (url, published) in enumerate(self.articles(), 1):
+            if cap and index > cap:
+                self.ctx.partial = True
+                break
             try:
                 for entry in self.entries(url, self.fetch(url, follow_redirects=False), published):
                     self.ctx.emit(entry)
@@ -112,8 +121,6 @@ class NoticeCollector(BaseCollector):
                     self.ctx.failure(f"公示页请求失败：{exc}", url)
             except (ValueError, RuntimeError) as exc:
                 self.ctx.failure(f"公示页采集失败：{exc}", url)
-            if cap and index >= cap:
-                break
 
     def replay(self):
         listings = {}

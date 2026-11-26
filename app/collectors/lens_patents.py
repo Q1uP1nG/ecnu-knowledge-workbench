@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from ..db import digest
+from ..lens_credential import windows_saved_token
 from ..patent_identity import patent_key, patent_number_key
 from ..store import Entry
 from .base import BaseCollector, FetchError, clean
@@ -19,16 +20,18 @@ GRANTED = ("GRANTED_PATENT", "AMENDED_PATENT", "LIMITED_PATENT", "DESIGN_RIGHT",
 STATUSES = dict.fromkeys(("ACTIVE", "PATENTED", "GRANTED"), "授权") | dict.fromkeys(
     ("EXPIRED", "DISCONTINUED", "REVOKED", "INVALID", "INACTIVE"), "无效")
 KINDS = {"1": "发明专利", "2": "实用新型", "3": "外观设计"}
+LENS_ID = re.compile(r"[0-9]{3}(?:-[0-9]{3}){3}-[0-9]{2}[0-9X]")
 PROJECTION = ["lens_id", "jurisdiction", "kind", "doc_number", "date_published", "publication_type",
               "biblio.invention_title", "biblio.application_number", "biblio.application_reference",
               "biblio.publication_reference", "biblio.parties.inventors", "biblio.classifications_cpc",
-              "biblio.classifications_ipcr", "biblio.classifications_ipc", "abstract", "legal_status.grant_date",
+              "biblio.classifications_ipcr", "abstract", "legal_status.grant_date",
               "legal_status.patent_status"]
 OFFSET_LIMIT = 10000
 
 
 def token():
-    value = os.getenv("LENS_API_TOKEN", "").strip()
+    configured = os.getenv("LENS_API_TOKEN")
+    value = (windows_saved_token() if configured is None else configured).strip()
     if not value:
         raise ValueError(MISSING_TOKEN)
     # Reject values that could create a malformed HTTP header. Never echo the value.
@@ -90,7 +93,7 @@ class LensPatentCollector(BaseCollector):
     def query(self, start, end, order, offset, size):
         filters = [
             {"terms": {"applicant.name.exact": [name.upper() for name in self.config["applicants"]]}},
-            {"bool": {"minimum_should_match": 1, "should": [
+            {"bool": {"should": [
                 {"terms": {"publication_type": list(GRANTED)}},
                 {"bool": {"filter": [{"term": {"jurisdiction": "WO"}}, {"term": {"legal_status.granted": True}}]}},
             ]}},
@@ -99,7 +102,7 @@ class LensPatentCollector(BaseCollector):
         if jurisdictions := self.config.get("jurisdictions"):
             filters.append({"terms": {"jurisdiction": jurisdictions}})
         return {"query": {"bool": {"filter": filters}}, "include": PROJECTION,
-                "sort": [{"date_published": order}, {"lens_id": "asc"}], "from": offset, "size": size}
+                "sort": [{"date_published": order}], "from": offset, "size": size}
 
     def emit_patent(self, patent):
         biblio = patent.get("biblio") or {}
@@ -142,8 +145,8 @@ class LensPatentCollector(BaseCollector):
         granted = legal.get("grant_date") or (evidence if document_type in GRANTED else "")
         year = re.match(r"\d{4}", granted)
         status = str(legal.get("patent_status") or "").upper()
-        lens_id = str(patent.get("lens_id") or "")
-        url = f"https://www.lens.org/lens/patent/{lens_id}" if re.fullmatch(r"\d{3}(?:-\d{3}){4}", lens_id) else ""
+        lens_id = str(patent.get("lens_id") or "").upper()
+        url = f"https://www.lens.org/lens/patent/{lens_id}" if LENS_ID.fullmatch(lens_id) else ""
         aliases = tuple(dict.fromkeys(patent_key("", value) for value in (app, app_ref, publication) if value))
         if url:
             aliases += ("lens:" + lens_id,)

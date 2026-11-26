@@ -89,6 +89,7 @@ class BaseCollector(ABC):
                 with self.client.stream(method, url, params=params, data=data, json=json_body, headers=headers,
                                         follow_redirects=follow_redirects) as response:
                     self.response_url = public_url(response.url)
+                    self.response_location = response.headers.get("location")
                     chunks, size = [], 0
                     for chunk in response.iter_bytes():
                         size += len(chunk)

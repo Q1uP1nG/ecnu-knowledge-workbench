@@ -8,6 +8,7 @@ from app.demo import seed
 from app.faculty_merge import merge_faculty
 from app.importer import import_xlsx
 from app.maintenance import cleanup
+from app.paper_faculty import link_faculty_papers
 from app.runner import OPTIONS, STATUS_KEYS, RunManager, options_for
 from app.schema import SPECS
 from app.store import Conflict, list_tombstones, restore_tombstone
@@ -28,6 +29,8 @@ def parser():
     app.add_argument("--db", help="SQLite 文件路径")
     commands = app.add_subparsers(dest="command", required=True)
     commands.add_parser("seed", help="写入可重复导入的本地示例")
+    link_papers = commands.add_parser("link-faculty-papers", help="离线刷新论文与师资的作者关联")
+    link_papers.add_argument("--dry-run", action="store_true", help="预检关联数量")
     tombstones = commands.add_parser("tombstones", help="管理删除记录的重采拦截标记")
     tombstone_commands = tombstones.add_subparsers(dest="action", required=True)
     tombstone_commands.add_parser("list").add_argument("--kind", choices=tuple(SPECS))
@@ -97,11 +100,15 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     args = parser().parse_args()
     def execute(db):
+        if args.command == "link-faculty-papers" and args.dry_run:
+            return link_faculty_papers(db, dry_run=True)
         if args.command == "faculty-merge":
             return merge_faculty(db, args.group, dry_run=args.dry_run)
         if args.command == "cleanup":
             return cleanup(db, keep_snapshots=args.keep_snapshots, dry_run=args.dry_run, vacuum=args.vacuum)
         db.initialize()
+        if args.command == "link-faculty-papers":
+            return link_faculty_papers(db)
         if args.command == "seed":
             return seed(db)
         if args.command == "tombstones":

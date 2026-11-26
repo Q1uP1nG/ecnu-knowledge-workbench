@@ -62,15 +62,17 @@ CHOICES = {
 DATES = {"政策发布时间", "申报截止时间", "采集日期", "成立日期"}
 INTEGERS = {"页数", "章节数", "年度", "社会保险参保人数", "参保年报年份", "研发人员数", "授权年份", "发表年份"}
 AMOUNTS = {"销售收入", "研发费用", "利润总额", "纳税总额"}
+TEXT_DATE = re.compile(r"([0-9]{4})([-/.])([0-9]{1,2})\2([0-9]{1,2})")
+CHINESE_DATE = re.compile(r"([0-9]{4})\s*年\s*([0-9]{1,2})\s*月\s*([0-9]{1,2})\s*日")
 LONG_FIELDS = set(fields("文档正文|章节原文|说明|政策摘要|支持对象|资助金额/力度|核心技术痛点|技术需求描述|技术特色|市场定位|核心团队介绍|经营范围|需求详情|审核备注|研究方向详述|代表性成果|技术摘要|解决的核心问题|项目简介|备注"))
 REVIEW = ("pending", "approved", "ignored")
 HINTS = {
     "主营产品/技术方向": "2–3 句话，150 字以内",
     "核心技术痛点": "100 字以上",
     "技术需求描述": "150 字以上",
-    "研究方向详述": "200 字以内",
+    "研究方向详述": "人工填写建议 200 字以内，自动采集保留原文",
     "研究方向关键词": "3–5 个中文关键词，逗号分隔",
-    "代表性成果": "1–3 项代表论文、专利或项目",
+    "代表性成果": "人工填写建议列 1–3 项，自动采集保留原文",
     "项目简介": "200–400 字，说明问题、工作和效果",
     "统一社会信用代码": "18 位",
     "申报截止时间": "YYYY-MM-DD 或长期",
@@ -99,22 +101,34 @@ def clean_values(kind, values, *, validate=False):
         if not validate:
             return value
         if field == spec.code:
-            value = str(value).upper()
-            expression = rf"{spec.prefix}\d{{3,}}" if spec.prefix else r"\d+"
-            if not re.fullmatch(expression, value):
-                raise ValueError(f"{field}格式示例为 {spec.prefix}001")
-            return value
+            raw = str(int(value) if isinstance(value, float) and value.is_integer() else value)
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw) or not any(char.isalnum() for char in raw):
+                raise ValueError(f"{field}须为 1–64 位字母、数字、连字符或下划线，且至少含一个字母或数字")
+            return raw.upper()
         if field in CHOICES and value not in CHOICES[field]:
             raise ValueError(f"{field}超出可选范围")
         if field in DATES and not (field == "申报截止时间" and value == "长期"):
+            text = str(value)
             try:
-                return date.fromisoformat(str(value)).isoformat()
+                if match := TEXT_DATE.fullmatch(text):
+                    return date(*map(int, match.group(1, 3, 4))).isoformat()
+                if match := CHINESE_DATE.fullmatch(text):
+                    return date(*map(int, match.groups())).isoformat()
+                return date.fromisoformat(text).isoformat()
             except ValueError:
-                raise ValueError(f"{field}请填写 YYYY-MM-DD") from None
-        if field in INTEGERS | AMOUNTS:
-            if not re.fullmatch(r"[+-]?\d+" if field in INTEGERS else r"[+-]?\d+(?:\.\d+)?", str(value)):
+                raise ValueError(f"{field}请填写有效的完整日期，如 YYYY-MM-DD") from None
+        if field in INTEGERS:
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            elif isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+(?:\.0+)?", value):
+                value = int(value.split(".", 1)[0])
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field}请填写非负整数")
+            return value
+        if field in AMOUNTS:
+            if not re.fullmatch(r"[+-]?\d+(?:\.\d+)?", str(value)):
                 raise ValueError(f"{field}请填写数字")
-            return int(value) if field in INTEGERS else float(value)
+            return float(value)
         if field == "统一社会信用代码":
             value = str(value).upper()
             if not re.fullmatch(r"[0-9A-HJ-NPQRTUWXY]{18}", value):

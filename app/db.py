@@ -29,7 +29,8 @@ def paper_keys_need_cascade(conn):
 
 def schema_backup_needed(conn):
     snapshot_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(raw_snapshots)")}
-    return (bool(snapshot_columns) and "request_url" not in snapshot_columns) or paper_keys_need_cascade(conn)
+    return (bool(snapshot_columns) and ("request_url" not in snapshot_columns or
+            not conn.exec_driver_sql("PRAGMA table_info(paper_faculty_links)").first())) or paper_keys_need_cascade(conn)
 
 
 def now():
@@ -156,6 +157,14 @@ records = {
 paper_org = Table("paper_org_units", metadata,
     Column("paper_id", ForeignKey("kb_papers.id", ondelete="CASCADE"), primary_key=True),
     Column("unit_id", ForeignKey("org_units.id", ondelete="CASCADE"), primary_key=True, index=True),
+)
+paper_faculty = Table("paper_faculty_links", metadata,
+    Column("paper_id", ForeignKey("kb_papers.id", ondelete="CASCADE"), primary_key=True),
+    Column("faculty_id", ForeignKey("kb_faculty.id", ondelete="CASCADE"), primary_key=True, index=True),
+    Column("author_name", String, nullable=False),
+    Column("source_id", String, nullable=False),
+    Column("author_ref", String, nullable=False),
+    Column("evidence", String, nullable=False),
 )
 patent_keys = Table("patent_keys", metadata,
     Column("key", String, primary_key=True),

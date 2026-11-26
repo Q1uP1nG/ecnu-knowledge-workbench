@@ -16,14 +16,15 @@ from openpyxl import Workbook, load_workbook
 from sqlalchemy import select, update
 
 from app.collectors.faculty import FacultyCollector
-from app.collectors.lens_patents import SOURCE_ID, LensPatentCollector
+from app.collectors.lens_patents import SOURCE_ID, LensPatentCollector, token as lens_token
+from app.collectors.lens_scholar import SOURCE_ID as SCHOLAR, LensScholarCollector, URL as SCHOLAR_URL
 from app.collectors.transfer import TransferCollector
-from app.db import ROOT, Database, digest, logs, now, records, snapshots, sources
+from app.db import ROOT, Database, digest, logs, now, paper_org, records, snapshots, sources
 from app.export import GROUPS, column_names, excel_file
-from app.importer import import_xlsx
+from app.importer import MAX_ROWS, import_xlsx
 from app.main import create_app
 from app.runner import RunManager
-from app.schema import COMPANY, RESEARCH, SERVICE
+from app.schema import COMPANY, RESEARCH, SERVICE, clean_values
 from app.store import Entry, Unit, sync_units, units, upsert_entry
 
 FACULTY = "ecnu_faculty"
@@ -87,8 +88,152 @@ class LensAndImport(unittest.TestCase):
         with self.db.engine.connect() as conn:
             return [dict(row) for row in conn.execute(select(records[kind]).order_by(records[kind].c.id)).mappings()]
 
+    def test_scholar_backfills_by_doi_and_accepts_only_affiliated_articles(self):
+        openalex = "ecnu_openalex_papers"
+        paper = records["papers"]
+        with self.db.write() as conn:
+            for n in (1, 2):
+                key = f"doi:10.1000/{n}"
+                upsert_entry(conn, openalex, Entry("papers", f"openalex:W{n}", {
+                    "论文标题": f"OpenAlex title {n}", "DOI/链接": key, "技术摘要": None,
+                    "发表年份": 2025,
+                }, f"https://openalex.org/W{n}", org_ids=(self.unit,), aliases=(key,)))
+            conn.execute(update(paper).where(paper.c.unique_key == "openalex:W2").values(
+                locked_fields=["技术摘要"], is_manual_locked=True))
+
+        def work(n, **overrides):
+            return {
+                "lens_id": f"111-222-333-444-00{n}",
+                "external_ids": [{"type": "doi", "value": f"10.1000/{n}"}],
+                "year_published": 2025, "date_published": "2025-06-01",
+                "title": f"Lens title {n}", "abstract": f"Lens abstract {n}",
+                "publication_type": "journal article", "source": {"title": "Journal"},
+                "authors": [{"first_name": "Ming", "last_name": "Zhang", "affiliations": [{
+                    "ids": [{"type": "ror", "value": "https://ror.org/02n96ep67"}],
+                    "name_original": "测试学院，华东师范大学",
+                }]}],
+            } | overrides
+
+        def fetch(url, **requests):
+            self.assertEqual(url, SCHOLAR_URL)
+            self.assertFalse(requests["follow_redirects"])
+            self.assertFalse(requests["cache_response"])
+            self.assertEqual(requests["headers"], {"Authorization": f"Bearer {TOKEN}"})
+            query = requests["json_body"]["query"]
+            found = [work(1), work(2)] if "terms" in query else [
+                work(3), work(4, authors=[]), work(5, title="Correction: Lens title"),
+                work(6, title="OpenAlex title 1"), work(7, publication_type="book chapter"),
+            ]
+            return json.dumps({"data": found, "total": len(found)}).encode()
+
+        with patch.dict("os.environ", {"LENS_API_TOKEN": TOKEN}), \
+                patch.object(LensScholarCollector, "fetch", side_effect=fetch):
+            run = RunManager(self.db).execute(SCHOLAR, overrides={"publication_year": 2025})
+        self.assertEqual((run["inserted"], run["updated"], run["skipped"], run["failed"]), (1, 1, 1, 0), run)
+        first, locked, added = self.all("papers")
+        self.assertEqual(
+            (first["values"]["论文标题"], first["values"]["技术摘要"], first["source_url"], first["source_id"]),
+            ("OpenAlex title 1", "Lens abstract 1", "https://openalex.org/W1", openalex))
+        self.assertIsNone(locked["values"]["技术摘要"])
+        self.assertEqual((added["source_id"], added["values"]["作者"]), (SCHOLAR, "Ming Zhang"))
+        with self.db.write() as conn:
+            links = set(conn.execute(select(paper_org.c.paper_id, paper_org.c.unit_id)))
+            self.assertEqual(links, {(first["id"], self.unit), (locked["id"], self.unit), (added["id"], self.unit)})
+            upsert_entry(conn, openalex, Entry("papers", "openalex:W1", {
+                "论文标题": "Edited OpenAlex title", "技术摘要": None, "DOI/链接": "doi:10.1000/1",
+            }, first["source_url"], org_ids=(self.unit,), aliases=("doi:10.1000/1",)))
+            cached = list(conn.scalars(select(snapshots.c.content_gzip).where(snapshots.c.source_id == SCHOLAR)))
+        self.assertEqual(self.all("papers")[0]["values"]["技术摘要"], "Lens abstract 1")
+        self.assertTrue(cached)
+        self.assertTrue(all(TOKEN.encode() not in gzip.decompress(raw) for raw in cached))
+        with patch.object(LensScholarCollector, "fetch", side_effect=AssertionError("replay called the network")):
+            replay = RunManager(self.db).execute(SCHOLAR, overrides={"replay_cache": True})
+        self.assertEqual((replay["inserted"], replay["updated"], replay["failed"]), (0, 0, 0), replay)
+
+    def test_scholar_reports_missing_token_without_fetching(self):
+        with patch("app.collectors.lens_scholar.token", side_effect=ValueError), \
+                patch.object(LensScholarCollector, "fetch") as fetch:
+            result = RunManager(self.db).execute(SCHOLAR)
+        fetch.assert_not_called()
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("LENS_API_TOKEN", result["error"])
+        self.assertIn("Scholar API", result["error"])
+
+    def test_import_api_skips_unknown_columns_and_still_rejects_duplicate_headers(self):
+        with TestClient(create_app(self.path)) as client:
+            standalone = one_sheet(COMPANY, [
+                ["企业名称", "填表人", "填表人"],
+                ["测试企业", "=InvalidFormula()", "已备注"],
+            ])
+            response = client.post("/api/import/xlsx", files={"file": ("input.xlsx", standalone)})
+            self.assertEqual(response.status_code, 200)
+            result = response.json()
+            self.assertFalse(result["errors"])
+            self.assertEqual(result["ignored_columns"], {COMPANY: ["填表人"]})
+            self.assertEqual(result["tables"]["companies"]["will_insert"], 1)
+        repeated = one_sheet(COMPANY, [["企业名称", "企业名称"], ["测试企业", "另一企业"]])
+        self.assertIn("表头重复", [item["message"] for item in self.file_test(repeated)["errors"]])
+
+    def test_import_accepts_complete_local_date_formats(self):
+        for value in ("2026/2/9", "2026.2.9", "2026年2月9日", "2026-02-09", datetime(2026, 2, 9)):
+            with self.subTest(value=value):
+                book = one_sheet(COMPANY, [["企业名称", "成立日期"], ["测试企业", value]])
+                result = self.file_test(book, dry_run=False)
+                self.assertTrue(result["committed"], result)
+                self.assertEqual(self.all("companies")[0]["values"]["成立日期"], "2026-02-09")
+        for invalid in ("2026-02-30", "2026年2月30日", "2026/2", "2026-2/9"):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "完整日期"):
+                clean_values("companies", {"成立日期": invalid}, validate=True)
+        self.assertEqual(clean_values("policies", {"申报截止时间": "长期"}, validate=True), {"申报截止时间": "长期"})
+
+    def test_import_integer_counts_and_signed_decimal_amounts(self):
+        book = one_sheet(COMPANY, [
+            ["企业名称", "年度", "研发人员数", "利润总额", "社会保险参保人数"],
+            ["测试企业", "2024.0", 3.0, -2.5, "0.00"],
+        ])
+        self.assertTrue(self.file_test(book, dry_run=False)["committed"])
+        values = self.all("companies")[0]["values"]
+        item = values["年度经营数据"][0]
+        self.assertEqual((item["年度"], item["研发人员数"], item["利润总额"], values["社会保险参保人数"]), (2024, 3, -2.5, 0))
+        for invalid in (2024.5, "2024.5", -1, "-1.0"):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "非负整数"):
+                clean_values("papers", {"发表年份": invalid}, validate=True)
+
+    def test_custom_record_code_round_trips_and_keeps_unique_constraint(self):
+        book = one_sheet(RESEARCH, [
+            ["学院项目"], ["项目名称", "成果编号"], ["外部项目", "ky2026-01_a"],
+        ])
+        result = self.file_test(book, dry_run=False)
+        self.assertTrue(result["committed"], result)
+        self.assertEqual(self.all("projects")[0]["record_code"], "KY2026-01_A")
+        with TestClient(create_app(self.path)) as client:
+            duplicate = client.post("/api/records/projects", json={"values": {"项目名称": "另一个", "成果编号": "KY2026-01_A"}})
+            self.assertEqual(duplicate.status_code, 409)
+            automatic = client.post("/api/records/projects", json={"values": {"项目名称": "自动编号项目"}})
+            self.assertEqual(automatic.json()["record_code"], "J001")
+        with self.assertRaisesRegex(ValueError, "64"):
+            clean_values("faculty", {"师资编号": "X" * 65}, validate=True)
+
+    def test_import_row_limit_counts_only_data_rows(self):
+        self.assertGreaterEqual(MAX_ROWS, 250_000)
+        book = Workbook()
+        sheet = book.active
+        sheet.title = COMPANY
+        sheet.append(["企业名称", "自用列"])
+        sheet.cell(50, 2, "只有辅助信息")
+        sheet.cell(100, 1).number_format = "0.00"
+        sheet.cell(200, 1, "第一家")
+        sheet.cell(400, 1, "第二家")
+        with patch("app.importer.MAX_ROWS", 2):
+            result = self.file_test(bytes_of(book))
+            self.assertFalse(result["errors"], result)
+            self.assertEqual(result["tables"]["companies"]["will_insert"], 2)
+            result = self.file_test(one_sheet(COMPANY, [["企业名称"], ["甲"], ["乙"], ["丙"]]))
+            self.assertIn("2 条非空数据行", result["errors"][0]["message"])
+
     def test_lens_missing_token_and_probe_explain_how_to_configure(self):
-        with patch.dict("os.environ", {"LENS_API_TOKEN": ""}), patch.object(LensPatentCollector, "fetch") as fetch:
+        with patch.dict("os.environ", {"LENS_API_TOKEN": "", "LOCALAPPDATA": str(self.path.parent)}), \
+             patch.object(LensPatentCollector, "fetch") as fetch:
             result = RunManager(self.db).execute(SOURCE_ID, dry_run=True)
             self.assertEqual(result["status"], "failed")
             self.assertIn("试用或机构访问", result["logs"][-2]["message"])
@@ -100,6 +245,30 @@ class LensAndImport(unittest.TestCase):
         self.assertEqual(probe.returncode, 1)
         self.assertIn("LENS_API_TOKEN", probe.stdout)
         self.assertNotIn("Traceback", probe.stderr)
+
+    def test_lens_prefers_explicit_environment_and_falls_back_to_saved_credential(self):
+        with patch("app.collectors.lens_patents.windows_saved_token", return_value=TOKEN) as saved:
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(lens_token(), TOKEN)
+            with patch.dict("os.environ", {"LENS_API_TOKEN": "explicit-test-token"}):
+                self.assertEqual(lens_token(), "explicit-test-token")
+            with patch.dict("os.environ", {"LENS_API_TOKEN": ""}):
+                with self.assertRaisesRegex(ValueError, "LENS_API_TOKEN"):
+                    lens_token()
+            saved.assert_called_once_with()
+
+    def test_lens_check_digit_x_keeps_source_link_and_alias(self):
+        lens_id = "001-121-212-306-19X"
+        payload = {"data": [PATENT_RECORD | {"lens_id": lens_id.lower()}], "total": 1}
+        with patch.dict("os.environ", {"LENS_API_TOKEN": TOKEN}), \
+             patch.object(LensPatentCollector, "fetch", return_value=json.dumps(payload).encode()):
+            result = RunManager(self.db).execute(SOURCE_ID)
+        self.assertEqual((result["status"], result["inserted"]), ("succeeded", 1))
+        row, = self.all("patents")
+        self.assertEqual(row["source_url"], "https://www.lens.org/lens/patent/" + lens_id)
+        with self.db.engine.connect() as conn:
+            alias = conn.exec_driver_sql("SELECT record_id FROM patent_keys WHERE key = ?", ("lens:" + lens_id,)).scalar_one()
+        self.assertEqual(alias, row["id"])
 
     def test_lens_localized_fields_authorization_and_shared_patent_identity(self):
         with self.db.write() as conn:
@@ -119,6 +288,7 @@ class LensAndImport(unittest.TestCase):
         sent = fetch.call_args.kwargs["json_body"]
         self.assertIn("EAST CHINA NORMAL UNIVERSITY", json.dumps(sent))
         self.assertNotIn(TOKEN, json.dumps(sent))
+        self.assertEqual(sent["sort"], [{"date_published": "desc"}])
         row, = self.all("patents")
         self.assertEqual(row["org_unit_id"], self.unit)
         self.assertEqual(row["source_id"], TRANSFER)
@@ -190,7 +360,8 @@ class LensAndImport(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         request = fetch.call_args.kwargs["json_body"]
         self.assertEqual((request["from"], request["size"]), (9950, 50))
-        self.assertIn("biblio.classifications_ipc", request["include"])
+        self.assertIn("biblio.classifications_ipcr", request["include"])
+        self.assertNotIn("biblio.classifications_ipc", request["include"])
         self.assertIn("A01B1/00", self.all("patents")[0]["values"]["技术领域关键词"])
 
     def test_lens_splits_full_windows_and_recovers_legacy_offset(self):

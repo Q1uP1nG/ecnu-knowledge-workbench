@@ -2,7 +2,7 @@ param(
     [ValidateSet('school', 'all')][string]$Scope = 'school',
     [ValidateRange(0, 3650)][int]$SkipRecentDays = 7,
     [switch]$SchoolRotation,
-    [ValidateRange(0, 10000)][int]$RotationTeachersPerUnit = 5,
+    [ValidateRange(0, 10000)][int]$RotationTeachersPerUnit = 0,
     [ValidateSet('Default', 'On', 'Off')][string]$Attachments = 'Default'
 )
 

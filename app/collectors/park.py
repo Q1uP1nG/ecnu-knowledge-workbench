@@ -296,7 +296,7 @@ class ScienceParkCollector(BaseCollector):
                     break
             keywords = [word for word in FIELD_WORDS if word in name or re.search(
                 rf"{re.escape(name)}[^。；]{{0,65}}(?:专注|主营|致力于|从事)[^。；]{{0,35}}{word}", intro)]
-            values = {"企业名称": name, "技术特色": intro[:450] if intro else None}
+            values = {"企业名称": name, "技术特色": intro or None}
             if keywords:
                 values["技术领域"] = "、".join(keywords)
             awards = [recognition for recognition in ("高新技术企业", "专精特新") if any(

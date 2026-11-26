@@ -6,7 +6,7 @@ param(
     [string]$WeeklyDay = 'Sunday',
     [ValidatePattern('^(?:[01]\d|2[0-3]):[0-5]\d$')][string]$WeeklyAt = '04:30',
     [ValidateRange(0, 3650)][int]$SkipRecentDays = 7,
-    [ValidateRange(0, 10000)][int]$WeeklyTeachersPerUnit = 5,
+    [ValidateRange(0, 10000)][int]$WeeklyTeachersPerUnit = 0,
     [ValidateSet('Default', 'On', 'Off')][string]$Attachments = 'Default',
     [switch]$DailyOnly,
     [PSCredential]$Credential,
