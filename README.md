@@ -120,7 +120,9 @@ Windows 工作台、CLI 和探测脚本也可读取当前 Windows 用户以 DPAP
 
 Lens Scholar 补充源使用同一凭据，账户需开通 Scholar API。它按 DOI 为库内论文补空白摘要，并核对华东师大作者署名，收录有 DOI、摘要和刊会信息的漏采期刊及会议论文。默认核对 2024 年至今，学校日常定时任务继续使用 OpenAlex。
 
-更新论文或教师后，可以在本地重算作者关联。命令从已有快照读取署名证据。打开教师或论文的详情即可查阅对应记录及匹配依据。
+`run-all --scope school`（或 `--scope all`）在批次结束后从本地快照刷新论文与教师的作者关联。结果写入 JSON 的 `paper_faculty`，Windows 定时任务会将该结果追加到 `data/logs/scheduled-YYYYMM.log`。其中 `added` 是本次新增的关联数。单个来源失败时仍可刷新已入库数据。主动中止批次时跳过刷新。
+
+单独采集论文或教师时，可用下列命令手动刷新。打开教师或论文的详情即可查阅关联记录及匹配依据。
 
 ```powershell
 .\.venv\Scripts\python.exe cli.py link-faculty-papers --dry-run

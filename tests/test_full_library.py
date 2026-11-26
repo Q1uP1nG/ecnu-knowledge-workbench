@@ -275,7 +275,7 @@ class FullLibrary(unittest.TestCase):
             collector.ctx.count.assert_not_called()
 
     def test_run_all_school_cli_continues_after_conflict_and_exception(self):
-        manager = Mock()
+        manager = Mock(db=self.db)
         manager.execute.side_effect = [
             Conflict("此来源正在采集"), RuntimeError("临时异常"),
             {"id": 1, "status": "succeeded", "skipped": 3, "failed": 0},
@@ -294,6 +294,7 @@ class FullLibrary(unittest.TestCase):
         self.assertEqual([source["source_id"] for source in report["sources"]], [FACULTY, PAPERS, TRANSFER])
         self.assertEqual([source["status"] for source in report["sources"]], ["conflict", "failed", "succeeded"])
         self.assertEqual((report["failed"], report["skipped"]), (2, 3))
+        self.assertEqual((report["paper_faculty"]["status"], report["paper_faculty"]["added"]), ("succeeded", 0))
 
     def test_faculty_uses_detail_budget_after_recent_profiles(self):
         home = "https://faculty.ecnu.edu.cn"
@@ -485,9 +486,28 @@ class FullLibrary(unittest.TestCase):
             self.assertEqual(conn.scalar(select(records["faculty"].c["values"]))["职称"], "教授")
 
     def test_run_all_preserves_partial_when_no_source_failed(self):
-        manager = Mock()
+        manager = Mock(db=self.db)
         manager.execute.side_effect = [{"status": "partial"}, {"status": "succeeded"}, {"status": "succeeded"}]
         self.assertEqual(cli.run_all(manager, "school", {})["status"], "partial")
+
+    def test_run_all_reports_author_refresh_failure(self):
+        manager = Mock(db=self.db)
+        manager.execute.return_value = {"status": "succeeded", "inserted": 1}
+        with patch.object(cli, "link_faculty_papers", side_effect=RuntimeError("测试关联失败")) as refresh:
+            result = cli.run_all(manager, "school", {})
+        refresh.assert_called_once_with(self.db)
+        self.assertEqual(manager.execute.call_count, 3)
+        self.assertEqual((result["status"], result["inserted"]), ("failed", 3))
+        self.assertEqual(result["paper_faculty"], {"status": "failed", "error": "测试关联失败"})
+
+    def test_run_all_skips_author_refresh_when_collection_is_cancelled(self):
+        manager = Mock(db=self.db)
+        manager.execute.return_value = {"status": "cancelled"}
+        with patch.object(cli, "link_faculty_papers") as refresh:
+            result = cli.run_all(manager, "school", {})
+        refresh.assert_not_called()
+        self.assertEqual(manager.execute.call_count, 1)
+        self.assertEqual((result["status"], result["paper_faculty"]["status"]), ("cancelled", "skipped"))
 
     def test_transfer_cleans_names_without_splitting_latin_surname(self):
         self.assertEqual(person_names(" 王 一；李二, 张三 /王一", " YU, Jiahui, LU, Wei, YU, Jiahui"),

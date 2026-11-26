@@ -92,7 +92,18 @@ def run_all(manager, scope, overrides):
     status = ("cancelled" if "cancelled" in statuses else
               "failed" if totals["failed"] or statuses & {"failed", "conflict"} else
               "partial" if "partial" in statuses else "succeeded")
-    return {"scope": scope, "status": status, **totals, "sources": results}
+    if status == "cancelled":
+        paper_faculty = {"status": "skipped", "reason": "采集已中止"}
+    else:
+        try:
+            paper_faculty = {"status": "succeeded", **link_faculty_papers(manager.db)}
+        except KeyboardInterrupt:
+            status = "cancelled"
+            paper_faculty = {"status": "cancelled"}
+        except Exception as exc:
+            status = "failed"
+            paper_faculty = {"status": "failed", "error": str(exc) or type(exc).__name__}
+    return {"scope": scope, "status": status, **totals, "sources": results, "paper_faculty": paper_faculty}
 
 
 def main():
